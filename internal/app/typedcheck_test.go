@@ -44,9 +44,10 @@ func TestTypedPromptLeftInBoxGetsReply(t *testing.T) {
 	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 7, "fix the tests")); err != nil {
 		t.Fatal(err)
 	}
-	// The bridge goroutine does not wait for the screen.
-	if n := visibleReads(f.herdr); n != 0 {
-		t.Fatalf("screen read %d times before the check was due", n)
+	// Turn tracking and an immediate screen capture are preserved even
+	// though Herdr's typed fallback cannot guarantee submission.
+	if n := visibleReads(f.herdr); n != 1 {
+		t.Fatalf("immediate screen read %d times, want 1", n)
 	}
 	f.tg.Reset()
 	f.fireInboundAfter(t, typedVerifyDelay, 1)
@@ -60,8 +61,8 @@ func TestTypedPromptTakenIsSilent(t *testing.T) {
 	}
 	f.tg.Reset()
 	f.fireInboundAfter(t, typedVerifyDelay, 1)
-	if n := visibleReads(f.herdr); n != 1 {
-		t.Fatalf("screen read %d times, want 1", n)
+	if n := visibleReads(f.herdr); n != 2 {
+		t.Fatalf("screen read %d times, want immediate and verification reads", n)
 	}
 	assertCallsEqual(t, f.tg)
 }
@@ -92,8 +93,8 @@ func TestTypedPromptNewerReplacesPending(t *testing.T) {
 	f.tg.Reset()
 	f.fireInboundAfter(t, typedVerifyDelay, 1)
 	assertCallsEqual(t, f.tg, "send:101:⚠️ "+failureReason(domain.ErrPromptNotSubmitted)+":reply=8")
-	if n := visibleReads(f.herdr); n != 1 {
-		t.Fatalf("screen read %d times, want 1", n)
+	if n := visibleReads(f.herdr); n != 3 {
+		t.Fatalf("screen read %d times, want two immediate and one verification read", n)
 	}
 	if len(f.in.typedChecks) != 0 {
 		t.Fatalf("checks left pending: %+v", f.in.typedChecks)
@@ -111,8 +112,8 @@ func TestTypedPromptAgentGoneDropsCheck(t *testing.T) {
 	}
 	f.tg.Reset()
 	f.fireInboundAfter(t, typedVerifyDelay, 1)
-	if n := visibleReads(f.herdr); n != 0 {
-		t.Fatalf("screen of a gone agent read %d times", n)
+	if n := visibleReads(f.herdr); n != 1 {
+		t.Fatalf("screen reads before the agent exited = %d, want 1", n)
 	}
 	assertCallsEqual(t, f.tg)
 }

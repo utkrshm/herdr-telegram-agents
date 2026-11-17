@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -33,6 +34,7 @@ type Bridge struct {
 	ownerReplies       chan ownerReply
 	ownerReplySlots    chan struct{}
 	ownerNoticeSlot    chan struct{}
+	promptNotices      chan promptNotice
 	failedOwnerReplies []ownerReplyResult // bridge-owned, independently bounded quarantine
 	PrivateBusy        func(int64)
 	// fatal carries the first fatal error; the daemon reads it once.
@@ -103,6 +105,7 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 		ownerReplies:    make(chan ownerReply, ownerReplyCapacity),
 		ownerReplySlots: make(chan struct{}, ownerReplyCapacity),
 		ownerNoticeSlot: make(chan struct{}, 1),
+		promptNotices:   make(chan promptNotice, 64),
 		fatal:           make(chan error, 1),
 		log:             log,
 		CallTimeout:     bridgeCallTimeout,
@@ -127,7 +130,55 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 			}
 		})
 	}
+	in.promptNotice = func(_ context.Context, key domain.Key, threadID, messageID int, confirmed bool) error {
+		gen, err := in.topics.generation(key, threadID)
+		if err != nil {
+			b.log.Warn("prompt notice could not pin topic generation", slog.String("key", key.String()), slog.Int("thread_id", threadID), slog.String("err", err.Error()))
+			return nil
+		}
+		select {
+		case b.promptNotices <- promptNotice{key: key, threadID: threadID, messageID: messageID, confirmed: confirmed, generation: gen}:
+			return nil
+		default:
+			return fmt.Errorf("prompt notice queue full")
+		}
+	}
 	return b
+}
+
+type promptNotice struct {
+	key        domain.Key
+	threadID   int
+	messageID  int
+	confirmed  bool
+	generation *topicGeneration
+}
+
+// runPromptNotices serializes prompt acknowledgements and their screen
+// snapshots. A slow capture cannot block the bridge loop, and FIFO processing
+// keeps successive prompts in a topic in their original order.
+func (b *Bridge) runPromptNotices(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case notice := <-b.promptNotices:
+			callCtx, cancel := context.WithTimeout(ctx, asyncTimeout)
+			err := b.in.postPromptNotice(callCtx, notice.key, notice.threadID, notice.messageID, notice.confirmed, notice.generation)
+			cancel()
+			if err == nil || errors.Is(err, errOwnerTopicChanged) || ctx.Err() != nil {
+				continue
+			}
+			if isFatal(err) {
+				select {
+				case b.fatal <- err:
+				default:
+				}
+				return
+			}
+			b.log.Warn("post-prompt notice failed", slog.String("key", notice.key.String()), slog.String("err", err.Error()))
+		}
+	}
 }
 
 // startResult is the job a background agent start submits when it is
@@ -272,6 +323,8 @@ func (b *Bridge) Run(ctx context.Context) {
 	b.out.replyEnqueue = b.enqueueOwnerReply
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.runOwnerReplies(ctx) }()
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.runPromptNotices(ctx) }()
 	defer b.wg.Wait()
 	var privateTick <-chan time.Time
 	if b.PrivateControl != nil {

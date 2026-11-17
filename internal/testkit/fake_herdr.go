@@ -90,10 +90,18 @@ type FakeHerdr struct {
 	// wait that long, or until the context ends, before answering.
 	startResult domain.Agent
 	startDelay  time.Duration
+	readDelay   time.Duration
 	failNext    map[string]error
 	info        domain.HerdrInfo
 	events      chan domain.Event
 	log         *slog.Logger
+}
+
+// SetReadDelay makes ReadScreen wait d before producing a result.
+func (f *FakeHerdr) SetReadDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readDelay = d
 }
 
 var (
@@ -344,7 +352,19 @@ func (f *FakeHerdr) ListAgents(context.Context) ([]domain.Agent, error) {
 	return append([]domain.Agent(nil), f.agents...), nil
 }
 
-func (f *FakeHerdr) ReadScreen(_ context.Context, target string, source domain.ScreenSource, lines int) (domain.Screen, error) {
+func (f *FakeHerdr) ReadScreen(ctx context.Context, target string, source domain.ScreenSource, lines int) (domain.Screen, error) {
+	f.mu.Lock()
+	delay := f.readDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return domain.Screen{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reads = append(f.reads, ReadCall{Target: target, Source: source, Lines: lines})

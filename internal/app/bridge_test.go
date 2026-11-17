@@ -78,13 +78,95 @@ func TestBridgeRunsJobsInOrder(t *testing.T) {
 	r.bridge.Submit(topicMsg(101, 1, "first"))
 	r.bridge.Submit(topicMsg(101, 2, "second"))
 	r.bridge.Submit(domain.GeneralCommand{MessageID: 3, FromID: 1, Text: "/help"})
-	// Each prompt gets its 👀 and the help reply comes last, so both
-	// prompts are already delivered when it shows up.
-	waitUntil(t, "three jobs", func() bool { return len(r.tg.Calls()) == 3 })
+	// Both accepted prompts are acknowledged and screened before /help.
+	waitUntil(t, "three jobs", func() bool { return len(r.tg.Calls()) == 7 })
 	if p := r.herdr.Prompts(); len(p) != 2 || p[0] != "p1: first" || p[1] != "p1: second" {
 		t.Fatalf("Prompts = %v", p)
 	}
-	assertCallsEqual(t, r.tg, "react:101:1:👀", "react:101:2:👀", "send:0:"+helpText+":reply=3")
+	calls := r.tg.Calls()
+	if len(calls) != 7 || calls[len(calls)-1] != "send:0:"+helpText+":reply=3" {
+		t.Fatalf("prompt jobs and help ordering = %q", calls)
+	}
+	counts := map[string]int{}
+	for _, call := range calls {
+		counts[call]++
+	}
+	if counts["react:101:1:👀"] != 1 || counts["react:101:2:👀"] != 1 || counts["send:101:✅ Prompt sent.:reply=1"] != 1 || counts["send:101:✅ Prompt sent.:reply=2"] != 1 || counts["send:101:screen:reply=1"] != 1 || counts["send:101:screen:reply=2"] != 1 {
+		t.Fatalf("prompt reactions/screens missing: %q", calls)
+	}
+	firstScreen, secondAck := -1, -1
+	for index, call := range calls {
+		if call == "send:101:screen:reply=1" {
+			firstScreen = index
+		}
+		if call == "send:101:✅ Prompt sent.:reply=2" {
+			secondAck = index
+		}
+	}
+	if firstScreen < 0 || secondAck < firstScreen {
+		t.Fatalf("same-topic notices reordered: %q", calls)
+	}
+}
+
+func TestPromptScreenCaptureDoesNotBlockBridgeControls(t *testing.T) {
+	r := newRunningBridge(t, func(f *bridgeFixture, _ *Bridge) {
+		f.herdr.SetReadDelay(250 * time.Millisecond)
+	})
+	r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	r.bridge.Submit(topicMsg(101, 91, "start work"))
+	r.bridge.Submit(topicMsg(101, 92, "/focus"))
+	waitUntil(t, "focus while screen capture is delayed", func() bool { return len(r.herdr.Focused()) == 1 })
+	waitUntil(t, "prompt acknowledgement", func() bool {
+		for _, call := range r.tg.Calls() {
+			if call == "send:101:✅ Prompt sent.:reply=91" {
+				return true
+			}
+		}
+		return false
+	})
+	if calls := r.tg.Calls(); len(calls) < 1 {
+		t.Fatalf("prompt acknowledgement did not precede capture: %q", calls)
+	}
+}
+
+func TestPromptNoticeFatalTelegramErrorReachesBridgeFatal(t *testing.T) {
+	r := newRunningBridge(t)
+	r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	r.tg.FailNext("send", domain.ErrForbidden)
+	r.bridge.Submit(topicMsg(101, 93, "start work"))
+	select {
+	case err := <-r.bridge.Fatal():
+		if !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("Fatal = %v, want forbidden", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fatal prompt acknowledgement error was not forwarded")
+	}
+}
+
+func TestQueuedPromptNoticeIsDroppedAfterTopicGenerationChanges(t *testing.T) {
+	r := newRunningBridge(t, func(f *bridgeFixture, _ *Bridge) {
+		f.herdr.SetReadDelay(200 * time.Millisecond)
+	})
+	a := r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	r.bridge.Submit(topicMsg(101, 94, "first"))
+	waitUntil(t, "first acknowledgement", func() bool {
+		for _, call := range r.tg.Calls() {
+			if call == "send:101:✅ Prompt sent.:reply=94" {
+				return true
+			}
+		}
+		return false
+	})
+	r.bridge.Submit(topicMsg(101, 95, "second"))
+	waitUntil(t, "second prompt accepted", func() bool { return len(r.herdr.Prompts()) == 2 })
+	r.bridge.out.topics.invalidate(a.Key)
+	time.Sleep(300 * time.Millisecond)
+	for _, call := range r.tg.Calls() {
+		if call == "send:101:✅ Prompt sent.:reply=95" || call == "send:101:screen:reply=95" {
+			t.Fatalf("stale prompt notice reached reassigned topic: %q", r.tg.Calls())
+		}
+	}
 }
 
 func TestBridgeSettleTimerFiresThroughRun(t *testing.T) {
@@ -454,13 +536,15 @@ func TestBridgeTurnTimerFiresThroughRun(t *testing.T) {
 	r.reactionsOn(t)
 	a := r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
 	r.bridge.Submit(topicMsg(101, 4, "go"))
-	waitUntil(t, "eyes", func() bool { return len(r.tg.Calls()) == 1 })
+	waitUntil(t, "prompt acknowledgement", func() bool { return len(r.tg.Calls()) == 3 })
 	r.bridge.Submit(AgentEvent{Kind: AgentChanged, Agent: r.setStatus(a, domain.StatusWorking)})
 	r.bridge.Submit(AgentEvent{Kind: AgentChanged, Agent: r.setStatus(a, domain.StatusIdle)})
 	waitUntil(t, "turn timer armed", func() bool { return r.clock.Pending() == 1 })
 	r.clock.Advance(turnSettle)
-	waitUntil(t, "idle completion", func() bool { return len(r.tg.Calls()) == 3 })
-	assertCallsEqual(t, r.tg, "react:101:4:👀", "react:101:4:👌", "send:101:screen")
+	waitUntil(t, "idle completion", func() bool { return len(r.tg.Calls()) == 5 })
+	if calls := r.tg.Calls(); len(calls) != 5 || calls[3] != "react:101:4:👌" || calls[4] != "send:101:screen" {
+		t.Fatalf("turn completion calls = %q", calls)
+	}
 }
 
 func TestBridgeRunsDownloadOffTheLoop(t *testing.T) {

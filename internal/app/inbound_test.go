@@ -36,8 +36,8 @@ func TestInboundPromptAndShortReply(t *testing.T) {
 	if p := f.herdr.Prompts(); len(p) != 1 || p[0] != "p1: fix the tests" {
 		t.Fatalf("Prompts = %v", p)
 	}
-	// Delivery is confirmed by 👀 on the message, never by a reply.
-	assertCallsEqual(t, f.tg, "react:101:5:👀")
+	// Accepted prompts get an acknowledgement and the visible screen.
+	assertCallsEqual(t, f.tg, "react:101:5:👀", "send:101:✅ Prompt sent.:reply=5", "send:101:screen:reply=5")
 
 	// "y" while idle is a prompt, while blocked a key press.
 	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 6, "y")); err != nil {
@@ -54,7 +54,9 @@ func TestInboundPromptAndShortReply(t *testing.T) {
 		t.Fatalf("Keys = %+v", k)
 	}
 	// The prompt reacted, the key press did not; no reply either way.
-	assertCallsEqual(t, f.tg, "react:101:5:👀", "react:101:6:👀")
+	assertCallsEqual(t, f.tg,
+		"react:101:5:👀", "send:101:✅ Prompt sent.:reply=5", "send:101:screen:reply=5",
+		"react:101:6:👀", "send:101:✅ Prompt sent.:reply=6", "send:101:screen:reply=6")
 }
 
 func TestInboundDebugLogCarriesNoText(t *testing.T) {
@@ -81,13 +83,13 @@ func TestInboundPromptReacts(t *testing.T) {
 	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 2, "hello")); err != nil {
 		t.Fatal(err)
 	}
-	assertCallsEqual(t, f.tg, "react:101:2:👀")
+	assertCallsEqual(t, f.tg, "react:101:2:👀", "send:101:✅ Prompt sent.:reply=2", "send:101:screen:reply=2")
 	// A failed prompt gets the ⚠️ reply and no reaction.
 	f.herdr.FailNext("prompt", domain.ErrDisconnected)
 	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 3, "again")); err != nil {
 		t.Fatal(err)
 	}
-	assertCallsEqual(t, f.tg, "react:101:2:👀", "send:101:⚠️ herdr is unreachable:reply=3")
+	assertCallsEqual(t, f.tg, "react:101:2:👀", "send:101:✅ Prompt sent.:reply=2", "send:101:screen:reply=2", "send:101:⚠️ herdr is unreachable:reply=3")
 	// Reactions off: the prompt goes through silently.
 	if err := f.opts.Set(f.ctx, domain.OptionPostsReactions, "false", 1); err != nil {
 		t.Fatal(err)
@@ -95,9 +97,102 @@ func TestInboundPromptReacts(t *testing.T) {
 	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 4, "quiet")); err != nil {
 		t.Fatal(err)
 	}
-	if calls := f.tg.Calls(); len(calls) != 2 {
+	if calls := f.tg.Calls(); len(calls) != 6 {
 		t.Fatalf("reaction with the option off: %q", calls)
 	}
+}
+
+func TestPromptAcknowledgementUsesAssociatedTopicAndVisibleScreen(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.add(t, "p1", "t1", "first", domain.StatusIdle)
+	f.add(t, "p2", "t2", "second", domain.StatusIdle)
+	f.herdr.SetScreen("p2", "visible output, not a transcript reply")
+	if err := f.in.HandleTopic(f.ctx, topicMsg(102, 17, "please proceed")); err != nil {
+		t.Fatal(err)
+	}
+	assertCallsEqual(t, f.tg,
+		"send:102:✅ Prompt sent.:reply=17", "send:102:visible output, not a transcript reply:reply=17")
+	reads := f.herdr.Reads()
+	if len(reads) != 1 || reads[0].Target != "p2" || reads[0].Source != domain.ScreenVisible {
+		t.Fatalf("screen reads = %+v", reads)
+	}
+}
+
+func TestPromptAcceptedWhileWorkingTracksTurn(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.add(t, "p1", "t1", "reviewer", domain.StatusWorking)
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 18, "keep going")); err != nil {
+		t.Fatal(err)
+	}
+	turn, ok := f.out.turns[domain.Key{PaneID: "p1", TerminalID: "t1"}]
+	if !ok || turn.started.IsZero() {
+		t.Fatalf("working prompt turn = %+v, exists=%v", turn, ok)
+	}
+}
+
+func TestPromptAcknowledgementOnlyAfterSubmission(t *testing.T) {
+	t.Run("failed prompt", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+		f.herdr.FailNext("prompt", domain.ErrDisconnected)
+		if err := f.in.HandleTopic(f.ctx, topicMsg(101, 20, "do it")); err != nil {
+			t.Fatal(err)
+		}
+		assertCallsEqual(t, f.tg, "send:101:⚠️ herdr is unreachable:reply=20")
+		if len(f.herdr.Reads()) != 0 {
+			t.Fatalf("read screen after failed prompt: %+v", f.herdr.Reads())
+		}
+	})
+	t.Run("blocked prompt", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.add(t, "p1", "t1", "reviewer", domain.StatusBlocked)
+		f.herdr.FailNext("prompt", domain.ErrAgentBlocked)
+		if err := f.in.HandleTopic(f.ctx, topicMsg(101, 21, "do it")); err != nil {
+			t.Fatal(err)
+		}
+		for _, call := range f.tg.Calls() {
+			if strings.Contains(call, "✅ Prompt sent.") {
+				t.Fatalf("acknowledged blocked prompt: %q", call)
+			}
+		}
+	})
+	t.Run("typed but uncertain", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+		f.herdr.SetTyped("p1")
+		if err := f.in.HandleTopic(f.ctx, topicMsg(101, 22, "do it")); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := f.out.turns[domain.Key{PaneID: "p1", TerminalID: "t1"}]; !ok {
+			t.Fatal("uncertain typed prompt did not open turn tracking")
+		}
+		if calls := f.tg.Calls(); len(calls) != 1 || calls[0] != "send:101:screen:reply=22" {
+			t.Fatalf("acknowledged uncertain submission: %q", calls)
+		}
+	})
+}
+
+func TestPromptAcknowledgementScreenUnavailableAndAckFailure(t *testing.T) {
+	t.Run("screen unavailable", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+		f.herdr.FailNext("read", domain.ErrDisconnected)
+		if err := f.in.HandleTopic(f.ctx, topicMsg(101, 23, "do it")); err != nil {
+			t.Fatal(err)
+		}
+		assertCallsEqual(t, f.tg, "send:101:✅ Prompt sent.:reply=23", "send:101:⚠️ Current screen is unavailable.:reply=23")
+	})
+	t.Run("ack failure is not retried", func(t *testing.T) {
+		f := newBridgeFixture(t)
+		f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+		f.tg.FailNext("send", domain.ErrForbidden)
+		if err := f.in.HandleTopic(f.ctx, topicMsg(101, 24, "do it")); !errors.Is(err, domain.ErrForbidden) {
+			t.Fatalf("HandleTopic error = %v, want forbidden acknowledgement error", err)
+		}
+		if calls := f.tg.Calls(); len(calls) != 1 || calls[0] != "send:101:✅ Prompt sent.:reply=24" {
+			t.Fatalf("acknowledgement was retried or replaced: %q", calls)
+		}
+	})
 }
 
 func TestInboundKeysFocusScreen(t *testing.T) {
@@ -1519,7 +1614,7 @@ func TestInboundAttachmentSavedAndPrompted(t *testing.T) {
 	if prompts := f.herdr.Prompts(); len(prompts) != 1 || prompts[0] != "p1: look\n\n/state/inbox/20260902-120000-42-photo.jpg" {
 		t.Fatalf("Prompts = %q", prompts)
 	}
-	assertCallsEqual(t, f.tg, "download:file1:20971520", "react:101:42:👀")
+	assertCallsEqual(t, f.tg, "download:file1:20971520", "react:101:42:👀", "send:101:✅ Prompt sent.:reply=42", "send:101:screen:reply=42")
 	// Claude Code drops the enter of a paste with an image path: a second
 	// enter follows after inboxSubmitDelay.
 	if n := len(f.herdr.Keys()); n != 0 {
@@ -1606,7 +1701,7 @@ func TestInboundAlbumIsOnePrompt(t *testing.T) {
 	if len(prompts) != 1 || prompts[0] != want {
 		t.Fatalf("Prompts = %q, want %q", prompts, want)
 	}
-	if calls := f.tg.Calls(); calls[len(calls)-1] != "react:101:50:👀" {
+	if calls := f.tg.Calls(); calls[len(calls)-1] != "send:101:screen:reply=50" {
 		t.Fatalf("Calls = %q", calls)
 	}
 }
@@ -1668,7 +1763,7 @@ func TestInboundAttachmentDownloadFails(t *testing.T) {
 	if prompts := f.herdr.Prompts(); len(prompts) != 1 || !strings.HasSuffix(prompts[0], "-81-photo.jpg") {
 		t.Fatalf("Prompts = %q", prompts)
 	}
-	assertCallsEqual(t, f.tg, "download:bad:20971520", "download:ok:20971520", "react:101:80:👀", "send:101:⚠️ 1 of 2 files failed: boom:reply=80")
+	assertCallsEqual(t, f.tg, "download:bad:20971520", "download:ok:20971520", "react:101:80:👀", "send:101:✅ Prompt sent.:reply=80", "send:101:screen:reply=80", "send:101:⚠️ 1 of 2 files failed: boom:reply=80")
 }
 
 func TestInboundAttachmentAgentGoneAfterDownload(t *testing.T) {

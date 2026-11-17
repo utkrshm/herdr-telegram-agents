@@ -140,6 +140,9 @@ type inbound struct {
 	// chrome reads the posts.chrome switch for the screens forwarded
 	// commands post.
 	chrome func() bool
+	// promptNotice runs the confirmation and visible-screen post away from
+	// the shared bridge loop. Nil keeps direct inbound fixtures synchronous.
+	promptNotice func(context.Context, domain.Key, int, int, bool) error
 
 	// deb arms the settle timer of a forwarded command; pending holds what
 	// to do when it fires. Both are touched on the bridge goroutine only.
@@ -306,7 +309,7 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 			i.checkTyped(key, msg.ThreadID, msg.MessageID, cmd.Text)
 		}
 		i.log.Debug("herdr call ok", slog.String("method", "prompt"), slog.String("key", key.String()), slog.Int("message_id", msg.MessageID))
-		return i.out.PromptSent(ctx, key, msg.ThreadID, msg.MessageID)
+		return i.promptRecorded(ctx, key, msg.ThreadID, msg.MessageID, !typed)
 	case domain.CmdKeys:
 		i.releasePicker(key, "keys")
 		return i.herdrCall(ctx, msg, key, "send_keys", func(ctx context.Context) error {
@@ -1243,7 +1246,8 @@ func (i *inbound) InboxFinished(ctx context.Context, r inboxResult) error {
 	// through its verified free-text entry, which submits it at once: no
 	// delayed enter follows. A typed prompt needs no screen check of its
 	// own: the delayed enter below is there for an agent that drops one.
-	if _, err := i.herdr.Prompt(ctx, r.key.PaneID, domain.AttachmentPrompt(r.caption, r.paths)); err != nil {
+	typed, err := i.herdr.Prompt(ctx, r.key.PaneID, domain.AttachmentPrompt(r.caption, r.paths))
+	if err != nil {
 		if errors.Is(err, domain.ErrAgentBlocked) {
 			return i.answerBlocked(ctx, msg, r.key, agent, domain.AttachmentPrompt(r.caption, r.paths))
 		}
@@ -1252,7 +1256,7 @@ func (i *inbound) InboxFinished(ctx context.Context, r inboxResult) error {
 	i.log.Info("inbox delivered", slog.String("key", r.key.String()), slog.Int("message_id", r.messageID), slog.Int("saved", len(r.paths)),
 		slog.Int("failed", len(r.failed)), slog.Int64("elapsed_ms", elapsed))
 	i.deb.ScheduleAfter(submitKey(r.key.PaneID), inboxSubmitDelay)
-	if err := i.out.PromptSent(ctx, r.key, r.threadID, r.messageID); err != nil {
+	if err := i.promptRecorded(ctx, r.key, r.threadID, r.messageID, !typed); err != nil {
 		return err
 	}
 	if len(r.failed) > 0 {
@@ -1380,6 +1384,69 @@ func (i *inbound) failed(ctx context.Context, msg domain.TopicMessage, key domai
 		return err
 	}
 	return i.reply(ctx, msg.ThreadID, msg.MessageID, "⚠️ "+failureReason(err))
+}
+
+// promptRecorded updates turn tracking for a prompt that Herdr accepted.
+// confirmed controls the user-facing success acknowledgement: Herdr's typed
+// fallback can have lost Enter, but still represents a prompt attempt worth
+// tracking and showing on screen.
+func (i *inbound) promptRecorded(ctx context.Context, key domain.Key, threadID, messageID int, confirmed bool) error {
+	if err := i.out.PromptSent(ctx, key, threadID, messageID); err != nil {
+		return err
+	}
+	if i.promptNotice != nil {
+		return i.promptNotice(ctx, key, threadID, messageID, confirmed)
+	}
+	return i.postPromptNotice(ctx, key, threadID, messageID, confirmed, nil)
+}
+
+func (i *inbound) postPromptNotice(ctx context.Context, key domain.Key, threadID, messageID int, confirmed bool, gen *topicGeneration) error {
+	guard := domain.DispatchGuard(nil)
+	if gen != nil {
+		guard = gen.guard
+		if gen.ctx.Err() != nil {
+			return nil
+		}
+	} else if current, ok := i.topics.KeyForThread(threadID); !ok || current != key {
+		return nil
+	}
+	if _, alive := i.agents(key); !alive {
+		return nil
+	}
+	if gen != nil {
+		guarded, release, err := gen.guard(ctx)
+		if err != nil {
+			return nil
+		}
+		ctx = guarded
+		defer release()
+	}
+	if confirmed {
+		var err error
+		if guard != nil {
+			_, err = i.tg.(interface {
+				SendGuard(context.Context, domain.Outgoing, domain.DispatchGuard) (int, error)
+			}).SendGuard(ctx, domain.Outgoing{ThreadID: threadID, ReplyTo: messageID, Text: "✅ Prompt sent."}, guard)
+		} else {
+			err = i.reply(ctx, threadID, messageID, "✅ Prompt sent.")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if err := i.out.CurrentScreen(ctx, key, messageID, guard); err != nil {
+		i.log.Warn("screen unavailable after prompt", slog.String("key", key.String()), slog.String("err", err.Error()))
+		if confirmed {
+			if guard != nil {
+				_, err = i.tg.(interface {
+					SendGuard(context.Context, domain.Outgoing, domain.DispatchGuard) (int, error)
+				}).SendGuard(ctx, domain.Outgoing{ThreadID: threadID, ReplyTo: messageID, Text: "⚠️ Current screen is unavailable."}, guard)
+				return err
+			}
+			return i.reply(ctx, threadID, messageID, "⚠️ Current screen is unavailable.")
+		}
+	}
+	return nil
 }
 
 // reply posts a silent message quoting the operator's message.

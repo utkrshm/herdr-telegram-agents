@@ -1466,6 +1466,36 @@ func (o *outbound) Screen(ctx context.Context, key domain.Key, lines int) error 
 	return nil
 }
 
+// CurrentScreen posts the visible terminal text without attempting to
+// substitute a transcript reply. It is used for the immediate post-prompt
+// snapshot, where the screen must reflect what is currently on the agent.
+func (o *outbound) CurrentScreen(ctx context.Context, key domain.Key, replyTo int, guard domain.DispatchGuard) error {
+	entry, ok := o.topics.Entry(key)
+	if !ok {
+		return fmt.Errorf("screen for %s: no topic", key)
+	}
+	screen, err := o.herdr.ReadScreen(ctx, key.PaneID, domain.ScreenVisible, 0)
+	if err != nil {
+		return err
+	}
+	text := o.clean(key, screen.Text)
+	if text == "" {
+		text = "(screen is empty)"
+	}
+	out := domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: true, ReplyTo: replyTo}
+	if guard == nil {
+		return o.sendRequested(ctx, key, out)
+	}
+	tg, ok := o.tg.(interface {
+		SendGuard(context.Context, domain.Outgoing, domain.DispatchGuard) (int, error)
+	})
+	if !ok {
+		return errors.New("telegram gateway does not support guarded screen delivery")
+	}
+	_, err = tg.SendGuard(ctx, out, guard)
+	return err
+}
+
 func (o *outbound) sendRequested(ctx context.Context, key domain.Key, out domain.Outgoing) error {
 	if o.replyEnqueue != nil {
 		return o.replyEnqueue(ownerReply{key: key, out: out})

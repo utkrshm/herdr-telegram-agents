@@ -141,7 +141,7 @@ func (i *inbound) typeAnswer(ctx context.Context, a entryAnswer) error {
 	if err := i.out.EntryAnswered(ctx, a.key, a.keyboard, a.text); err != nil {
 		return err
 	}
-	return i.out.PromptSent(ctx, a.key, a.threadID, a.messageID)
+	return i.promptRecorded(ctx, a.key, a.threadID, a.messageID, true)
 }
 
 // TextEntryDialog returns the dialog behind key's latest buttons and the

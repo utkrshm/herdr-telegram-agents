@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
@@ -62,7 +63,10 @@ func TestEntryAnswerTypesThroughVerifiedEntry(t *testing.T) {
 	if keys := f.herdr.Keys(); len(keys) != 2 || !reflect.DeepEqual(keys[1].Keys, []string{domain.KeyEnter}) {
 		t.Fatalf("Keys = %+v", keys)
 	}
-	assertCallsEqual(t, f.tg, "buttons:1000:✅ ✏️ · teal 2 please", "react:101:7:👀")
+	calls := f.tg.Calls()
+	if len(calls) != 4 || calls[0] != "buttons:1000:✅ ✏️ · teal 2 please" || calls[1] != "react:101:7:👀" || calls[2] != "send:101:✅ Prompt sent.:reply=7" || !strings.HasPrefix(calls[3], "send:101:") {
+		t.Fatalf("entry confirmation calls = %q", calls)
+	}
 }
 
 func TestEntryAnswerTypesIntoFocusedEntryWithoutDigit(t *testing.T) {
