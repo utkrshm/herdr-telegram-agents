@@ -185,7 +185,7 @@ func (p *PrivateOutput) deliver(ctx context.Context, job privateOutputPending) e
 		}
 		c.dropDialogButtons(o)
 		buttons := p.dialogButtons(o, screen.Text, job.agent)
-		id, err := c.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: text, Code: !formatted, Markdown: formatted, Footer: footer, Fold: m.Preferences.Fold, Notify: job.agent.Status == domain.StatusBlocked && !m.Preferences.Silent && !job.silent, Buttons: buttons, MaxParts: 4}, c.Sharing.Guard(o, domain.ShareOutput))
+		id, err := c.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: text, Code: !formatted, Markdown: formatted, Footer: footer, Fold: m.Preferences.Fold, Notify: job.agent.Status == domain.StatusBlocked && !m.Preferences.Silent && !job.silent, Buttons: buttons}, c.Sharing.Guard(o, domain.ShareOutput))
 		if err != nil {
 			if errors.Is(err, domain.ErrForbidden) || errors.Is(err, domain.ErrRecipientUnavailable) {
 				_ = c.Sharing.Reachability(ctx, g.RecipientID, true, c.Now())
@@ -293,7 +293,7 @@ func (p *PrivateOutput) Read(ctx context.Context, o domain.ShareOrigin, cmd doma
 					footer = reply.Meta.Line()
 				}
 				formatted := m.Preferences.Display == "formatted"
-				_, err = c.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: reply.Text, Code: !formatted, Markdown: formatted, Fold: m.Preferences.Fold, Footer: footer, ReplyTo: o.MessageID, MaxParts: 4}, c.Sharing.Guard(o, domain.ShareScreen))
+				_, err = c.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: reply.Text, Code: !formatted, Markdown: formatted, Fold: m.Preferences.Fold, Footer: footer, ReplyTo: o.MessageID}, c.Sharing.Guard(o, domain.ShareScreen))
 				return err
 			}
 		}

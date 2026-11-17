@@ -2,15 +2,15 @@ package telegram
 
 import (
 	"html"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 )
 
 const (
-	// textMax leaves headroom below Telegram's 4096-character message limit.
-	// Telegram counts the text after entity parsing, so tags and escapes
-	// cost nothing; the margin only absorbs rounding at chunk boundaries.
-	textMax = 4096 - 64
+	// textMax stays below Telegram's 4096-character limit with room for the
+	// multi-part suffix and formatting wrappers.
+	textMax = 4000
 	// defaultTopicName is used when a label is empty after trimming.
 	defaultTopicName = "agent"
 )
@@ -47,6 +47,73 @@ func chunk(text string, max int) []string {
 			return out
 		}
 	}
+}
+
+// splitResponse splits a response without dropping or rewriting source
+// characters. Sentence and newline boundaries are preferred; oversized
+// sentences fall back to rune-safe UTF-16 boundaries. Every part carries a
+// chunk-number/total suffix, whose varying width is accounted for iteratively.
+type responsePart struct{ content, suffix string }
+
+func splitResponse(text string, max int) []responsePart {
+	if text == "" {
+		return nil
+	}
+	if utf16Len(text) <= max {
+		return []responsePart{{content: text}}
+	}
+	total := 2
+	for attempt := 0; attempt < 16; attempt++ {
+		parts := splitResponseForTotal(text, max, total)
+		if len(parts) == total {
+			return parts
+		}
+		if len(parts) < 2 {
+			return []responsePart{{content: text}}
+		}
+		total = len(parts)
+	}
+	return splitResponseForTotal(text, max, total+1)
+}
+
+func splitResponseForTotal(text string, max, total int) []responsePart {
+	var parts []responsePart
+	for len(text) > 0 {
+		index := len(parts)
+		suffix := responseSuffix(index+1, total)
+		budget := max - utf16Len(suffix)
+		if utf16Len(text) <= budget {
+			parts = append(parts, responsePart{text, suffix})
+			break
+		}
+		rs := []rune(text)
+		fit := fitUTF16(rs, budget)
+		cut := naturalCut(rs[:fit])
+		if cut <= 0 {
+			cut = fit
+		}
+		if cut <= 0 {
+			cut = 1
+		}
+		parts = append(parts, responsePart{string(rs[:cut]), suffix})
+		text = string(rs[cut:])
+	}
+	return parts
+}
+
+func responseSuffix(chunk, total int) string {
+	return "\n… (" + strconv.Itoa(chunk) + "/" + strconv.Itoa(total) + ")"
+}
+
+func naturalCut(rs []rune) int {
+	min := len(rs) / 2
+	for i := len(rs) - 1; i >= min; i-- {
+		switch rs[i] {
+		case '\n', '.', '!', '?', '。', '！', '？':
+			return i + 1
+		}
+	}
+	return len(rs)
 }
 
 // fitUTF16 returns how many leading runes of rs fit into max UTF-16 code

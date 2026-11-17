@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"sync"
 
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
@@ -12,13 +14,22 @@ import (
 // current Telegram call. Entries are copies; nothing here aliases the
 // mapping.
 type topicView struct {
-	mu       sync.RWMutex
-	entries  map[domain.Key]domain.TopicEntry
-	byThread map[int]domain.Key
+	mu          sync.RWMutex
+	entries     map[domain.Key]domain.TopicEntry
+	byThread    map[int]domain.Key
+	generations map[domain.Key]*topicGeneration
 }
 
+type topicGeneration struct {
+	thread int
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+var errOwnerTopicChanged = errors.New("owner topic mapping changed")
+
 func newTopicView() *topicView {
-	return &topicView{entries: map[domain.Key]domain.TopicEntry{}, byThread: map[int]domain.Key{}}
+	return &topicView{entries: map[domain.Key]domain.TopicEntry{}, byThread: map[int]domain.Key{}, generations: map[domain.Key]*topicGeneration{}}
 }
 
 // publish replaces the snapshot with the mapping's current content.
@@ -38,8 +49,56 @@ func (v *topicView) publish(m *domain.Mapping) {
 		}
 	}
 	v.mu.Lock()
+	for key, gen := range v.generations {
+		e, ok := entries[key]
+		if !ok || e.ThreadID != gen.thread || byThread[gen.thread] != key || !e.Status.Live() {
+			gen.cancel()
+			delete(v.generations, key)
+		}
+	}
 	v.entries, v.byThread = entries, byThread
 	v.mu.Unlock()
+}
+
+// generation pins a key/thread association and is cancelled on remapping.
+// Already dispatched network requests cannot be recalled reliably.
+func (v *topicView) generation(key domain.Key, thread int) (*topicGeneration, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	e, ok := v.entries[key]
+	if !ok || e.ThreadID != thread || v.byThread[thread] != key || !e.Status.Live() {
+		return nil, errOwnerTopicChanged
+	}
+	if gen := v.generations[key]; gen != nil {
+		return gen, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gen := &topicGeneration{thread: thread, ctx: ctx, cancel: cancel}
+	v.generations[key] = gen
+	return gen, nil
+}
+
+func (v *topicView) invalidate(key domain.Key) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if gen := v.generations[key]; gen != nil {
+		gen.cancel()
+		delete(v.generations, key)
+	}
+}
+
+func (g *topicGeneration) guard(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if g.ctx.Err() != nil {
+		return nil, nil, errOwnerTopicChanged
+	}
+	call, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(g.ctx, cancel)
+	if g.ctx.Err() != nil {
+		stop()
+		cancel()
+		return nil, nil, errOwnerTopicChanged
+	}
+	return call, func() { stop(); cancel() }, nil
 }
 
 // Entry returns a copy of the entry for key.

@@ -23,9 +23,6 @@ const (
 	blockedLines = 25
 	// doneLines is the shorter tail posted on done.
 	doneLines = 12
-	// replyMaxParts caps a done post taken from the transcript: a reply
-	// longer than this many messages is cut with a trailer.
-	replyMaxParts = 5
 	// replyPendingRetries and replyPendingDelay bound the wait for a done
 	// post whose reply source says the turn is still running (OpenCode
 	// reports done at every step of a turn): the post is fired again up to
@@ -39,7 +36,7 @@ const (
 	// bridgeBuffer bounds jobs waiting for the bridge goroutine.
 	bridgeBuffer = 256
 	// bridgeCallTimeout bounds one bridge job (Herdr read plus Telegram send).
-	bridgeCallTimeout = 15 * time.Second
+	bridgeCallTimeout = 45 * time.Second
 	// dropReportInterval is how often the daemon warns about bridge jobs
 	// lost to overflow; each drop itself is logged at debug.
 	dropReportInterval = 1 * time.Minute

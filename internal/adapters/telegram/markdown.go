@@ -305,6 +305,7 @@ func splitMarkdown(text string, max int) []string {
 			}
 			rs := []rune(line)
 			n := fitUTF16(rs, avail)
+			n = naturalCut(rs[:n])
 			cur = append(cur, string(rs[:n]))
 			flush(true)
 			line = string(rs[n:])

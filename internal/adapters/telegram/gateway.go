@@ -426,6 +426,11 @@ func (g *Gateway) Send(ctx context.Context, out domain.Outgoing) (int, error) {
 	return g.send(ctx, g.chatID, out.ThreadID, out, nil)
 }
 
+// SendGuard rechecks ownership immediately before every multipart dispatch.
+func (g *Gateway) SendGuard(ctx context.Context, out domain.Outgoing, guard domain.DispatchGuard) (int, error) {
+	return g.send(ctx, g.chatID, out.ThreadID, out, guard)
+}
+
 // SendDirect posts into the private chat with userID: the same splitting,
 // rendering and buttons as Send, addressed by user id with no thread. A
 // chat the user never opened or blocked is ErrForbidden (Telegram's
@@ -451,34 +456,48 @@ func (g *Gateway) send(ctx context.Context, chatID int64, threadID int, out doma
 	if footer != "" {
 		limit -= utf16Len(footer) + 1
 	}
-	var parts []string
+	var parts []responsePart
 	if markdown {
-		parts = splitMarkdown(out.Text, limit)
+		chunks := splitMarkdown(out.Text, limit-32)
+		for i, chunk := range chunks {
+			p := responsePart{content: chunk}
+			if len(chunks) > 1 {
+				p.suffix = responseSuffix(i+1, len(chunks))
+			}
+			parts = append(parts, p)
+		}
 	} else {
-		parts = chunk(out.Text, limit)
+		parts = splitResponse(out.Text, limit)
 	}
-	parts, droppedParts, droppedChars := capParts(parts, out.MaxParts)
+	parts, droppedParts, droppedChars := capParts(parts, out.MaxParts, limit)
 	if markdown || out.MaxParts > 0 || footer != "" {
 		g.log.Debug("message split", slog.Int("thread_id", out.ThreadID), slog.Bool("markdown", markdown), slog.Int("limit", limit),
 			slog.Int("parts", len(parts)), slog.Int("dropped_parts", droppedParts), slog.Int("dropped_chars", droppedChars))
 	}
 	lastID := 0
 	for i, part := range parts {
-		body := renderPlain(part)
+		content, partSuffix := part.content, part.suffix
+		body := renderPlain(content)
 		switch {
 		case out.Code:
-			body = renderCode(part)
+			body = renderCode(content)
 		case out.HTML:
-			body = part
+			body = content
 		case markdown:
-			body = renderMarkdown(part)
+			body = renderMarkdown(content)
 		}
-		folded := out.Fold > 0 && strings.Count(part, "\n")+1 > out.Fold
+		folded := out.Fold > 0 && strings.Count(content, "\n")+1 > out.Fold
 		partFooter := ""
 		if i == len(parts)-1 {
 			partFooter = footer
 		}
-		body = wrap(body, folded, partFooter)
+		body = wrap(body, folded, "")
+		if partSuffix != "" {
+			body += renderPlain(partSuffix)
+		}
+		if partFooter != "" {
+			body += "\n" + renderPlain(partFooter)
+		}
 		params := &bot.SendMessageParams{
 			ChatID:              chatID,
 			MessageThreadID:     threadID,
@@ -505,19 +524,25 @@ func (g *Gateway) send(ctx context.Context, chatID int64, threadID int, out doma
 			g.log.Warn("markdown rejected, re-sent as pre",
 				slog.Int("thread_id", out.ThreadID), slog.Int("part", i+1), slog.Int("parts", len(parts)),
 				slog.Any("err", err))
-			params.Text = wrap(renderCode(part), folded, partFooter)
+			params.Text = wrap(renderCode(content), folded, "")
+			if partSuffix != "" {
+				params.Text += renderPlain(partSuffix)
+			}
+			if partFooter != "" {
+				params.Text += "\n" + renderPlain(partFooter)
+			}
 			id, err = g.sendPart(ctx, params, guard)
 		}
 		if err != nil {
 			g.log.Warn("sendMessage failed",
 				slog.Int("thread_id", out.ThreadID), slog.Int("part", i+1), slog.Int("parts", len(parts)), slog.Any("err", err))
-			return 0, fmt.Errorf("sendMessage thread %d part %d/%d: %w", out.ThreadID, i+1, len(parts), err)
+			return lastID, fmt.Errorf("sendMessage thread %d part %d/%d (last acknowledged message %d): %w", out.ThreadID, i+1, len(parts), lastID, err)
 		}
 		lastID = id
 		g.log.Debug("sendMessage",
 			slog.Int64("chat_id", chatID), slog.Int("thread_id", threadID), slog.Int("part", i+1), slog.Int("parts", len(parts)),
 			slog.Int("reply_to", out.ReplyTo), slog.Bool("notify", out.Notify),
-			slog.Int("runes", utf8.RuneCountInString(part)), slog.Int("buttons", buttons),
+			slog.Int("runes", utf8.RuneCountInString(content)), slog.Int("buttons", buttons),
 			slog.Bool("folded", folded), slog.Bool("footer", partFooter != ""), slog.Int("message_id", lastID))
 	}
 	return lastID, nil
@@ -552,29 +577,58 @@ func truncateFooter(footer string, max int) string {
 
 // sendPart sends one message through the queue and returns its id.
 func (g *Gateway) sendPart(ctx context.Context, params *bot.SendMessageParams, guard domain.DispatchGuard) (int, error) {
-	id := 0
-	err := g.destinationQueue(params.ChatID).DoGuard(ctx, guard, func(ctx context.Context) error {
+	var id atomic.Int64
+	do := g.destinationQueue(params.ChatID).DoGuard
+	if guard != nil {
+		do = g.destinationQueue(params.ChatID).DoOnceGuard
+	}
+	err := do(ctx, guard, func(ctx context.Context) error {
 		msg, err := g.api.SendMessage(ctx, params)
-		if err == nil && msg != nil {
-			id = msg.ID
+		if err == nil {
+			if msg == nil || msg.ID <= 0 {
+				return errors.New("sendMessage returned no valid acknowledgement")
+			}
+			id.Store(int64(msg.ID))
 		}
 		return translate(err)
 	})
-	return id, err
+	return int(id.Load()), err
 }
 
 // capParts keeps at most max parts (0 = all) and appends a trailer naming
 // the dropped characters to the last kept part. It reports how many parts
 // and characters were dropped.
-func capParts(parts []string, max int) ([]string, int, int) {
+func capParts(parts []responsePart, max, limit int) ([]responsePart, int, int) {
 	if max <= 0 || len(parts) <= max {
 		return parts, 0, 0
 	}
-	dropped := strings.Join(parts[max:], "\n")
-	chars := utf8.RuneCountInString(dropped)
-	kept := append([]string(nil), parts[:max]...)
-	kept[max-1] += fmt.Sprintf("\n… (+%d chars)", chars)
-	return kept, len(parts) - max, chars
+	dropped := strings.Builder{}
+	for _, part := range parts[max:] {
+		dropped.WriteString(part.content)
+	}
+	kept := make([]responsePart, max)
+	for i, part := range parts[:max] {
+		kept[i] = responsePart{content: part.content}
+	}
+	droppedChars := utf8.RuneCountInString(dropped.String())
+	last := []rune(kept[max-1].content)
+	var trailer string
+	for {
+		trailer = responseSuffix(max, max) + fmt.Sprintf("\n… (+%d chars)", droppedChars)
+		budget := limit - utf16Len(trailer)
+		fit := fitUTF16(last, budget)
+		if fit < len(last) {
+			droppedChars += utf8.RuneCountInString(string(last[fit:]))
+			last = last[:fit]
+			continue
+		}
+		break
+	}
+	for i := 0; i < max-1; i++ {
+		kept[i].suffix = responseSuffix(i+1, max)
+	}
+	kept[max-1] = responsePart{content: string(last), suffix: trailer}
+	return kept, len(parts) - max, droppedChars
 }
 
 // inlineKeyboard renders buttons as an inline keyboard with one button per
@@ -725,6 +779,10 @@ func (g *Gateway) SendDocument(ctx context.Context, doc domain.Document) error {
 	return g.DocumentAt(ctx, domain.TopicAddress{ChatID: g.chatID, ThreadID: doc.ThreadID}, doc, nil)
 }
 
+func (g *Gateway) SendDocumentGuard(ctx context.Context, doc domain.Document, guard domain.DispatchGuard) error {
+	return g.DocumentAt(ctx, domain.TopicAddress{ChatID: g.chatID, ThreadID: doc.ThreadID}, doc, guard)
+}
+
 func (g *Gateway) DocumentAt(ctx context.Context, address domain.TopicAddress, doc domain.Document, guard domain.DispatchGuard) error {
 	params := &bot.SendDocumentParams{
 		ChatID:                      address.ChatID,
@@ -737,7 +795,11 @@ func (g *Gateway) DocumentAt(ctx context.Context, address domain.TopicAddress, d
 	if doc.ReplyTo != 0 {
 		params.ReplyParameters = &models.ReplyParameters{MessageID: doc.ReplyTo, AllowSendingWithoutReply: true}
 	}
-	err := g.destinationQueue(address.ChatID).DoGuard(ctx, guard, func(ctx context.Context) error {
+	do := g.destinationQueue(address.ChatID).DoGuard
+	if guard != nil {
+		do = g.destinationQueue(address.ChatID).DoOnceGuard
+	}
+	err := do(ctx, guard, func(ctx context.Context) error {
 		params.Document = &models.InputFileUpload{Filename: doc.Name, Data: bytes.NewReader(doc.Data)}
 		_, err := g.api.SendDocument(ctx, params)
 		return translate(err)

@@ -359,7 +359,7 @@ func TestOutboundScreenPrefersFreshReply(t *testing.T) {
 			t.Fatal(err)
 		}
 		sent := f.tg.Sent()
-		if len(sent) != 1 || sent[0].Text != "Endpoint is **live** now." || sent[0].Code || !sent[0].Markdown || sent[0].MaxParts != replyMaxParts {
+		if len(sent) != 1 || sent[0].Text != "Endpoint is **live** now." || sent[0].Code || !sent[0].Markdown || sent[0].MaxParts != 0 {
 			t.Fatalf("%s: Sent = %+v", st, sent)
 		}
 		if reads := f.herdr.Reads(); len(reads) != 0 {
@@ -418,7 +418,7 @@ func screenReplyCase(t *testing.T, kind string, st domain.Status, lines int, ans
 	}
 	sent := f.tg.Sent()
 	if lines == 0 && st.ReadyForInput() {
-		if len(sent) != 1 || sent[0].Text != answer || !sent[0].Markdown || sent[0].Code || sent[0].MaxParts != replyMaxParts || len(f.herdr.Reads()) != 0 {
+		if len(sent) != 1 || sent[0].Text != answer || !sent[0].Markdown || sent[0].Code || sent[0].MaxParts != 0 || len(f.herdr.Reads()) != 0 {
 			t.Fatalf("%s %s /screen %d: sent %+v, reads %v; want the answer, rendered and bounded", kind, st, lines, sent, f.herdr.Reads())
 		}
 		return
@@ -428,17 +428,21 @@ func screenReplyCase(t *testing.T, kind string, st domain.Status, lines int, ans
 	}
 }
 
-func TestOutboundScreenReplyIsBounded(t *testing.T) {
+func TestOutboundScreenReplyIsUnbounded(t *testing.T) {
 	f := newBridgeFixture(t)
 	a := f.add(t, "p1", "t1", "a", domain.StatusDone)
 	a.Kind = "opencode"
 	f.agents[a.Key] = a
-	f.replies.Set(a.Key, strings.Repeat("long reply ", 100000))
+	answer := strings.TrimSpace(strings.Repeat("long reply ", 10000))
+	f.replies.Set(a.Key, answer)
 	if err := f.out.Screen(f.ctx, a.Key, 0); err != nil {
 		t.Fatal(err)
 	}
-	if sent := f.tg.Sent(); len(sent) != 1 || sent[0].MaxParts != replyMaxParts || !sent[0].Markdown || sent[0].Notify {
-		t.Fatalf("bounded reply = %+v", sent)
+	if sent := f.tg.Sent(); len(sent) != 1 || sent[0].Text != answer || sent[0].MaxParts != 0 || !sent[0].Markdown || sent[0].Notify {
+		if len(sent) != 1 {
+			t.Fatalf("unbounded reply sent %d messages, want one", len(sent))
+		}
+		t.Fatalf("unbounded reply text length = %d, want %d; MaxParts=%d", len(sent[0].Text), len(answer), sent[0].MaxParts)
 	}
 	f.tg.FailNext("send", domain.ErrForbidden)
 	if err := f.out.Screen(f.ctx, a.Key, 0); !errors.Is(err, domain.ErrForbidden) || len(f.herdr.Reads()) != 0 {
@@ -1046,8 +1050,8 @@ func TestOutboundDoneModes(t *testing.T) {
 		reads    int
 	}{
 		{domain.DoneScreen, "recap: all tests pass", true, false, 0, 1},
-		{domain.DoneReply, "Done. **All** tests pass.", true, false, replyMaxParts, 0},
-		{domain.DoneFormatted, "Done. **All** tests pass.", false, true, replyMaxParts, 0},
+		{domain.DoneReply, "Done. **All** tests pass.", true, false, 0, 0},
+		{domain.DoneFormatted, "Done. **All** tests pass.", false, true, 0, 0},
 	} {
 		t.Run(string(tc.mode), func(t *testing.T) {
 			f := newBridgeFixture(t)
@@ -1077,7 +1081,7 @@ func TestOutboundDoneModes(t *testing.T) {
 			if calls := len(f.replies.Calls()); calls != 1 {
 				t.Errorf("reply lookups = %d, want 1", calls)
 			}
-			if got.Footer != "" || got.Fold != map[bool]int{true: 20}[tc.mode != domain.DoneScreen] {
+			if got.Footer != "" || got.Fold != 0 {
 				t.Errorf("footer/fold without meta = %q / %d", got.Footer, got.Fold)
 			}
 			line := "screen posted"
@@ -1088,6 +1092,28 @@ func TestOutboundDoneModes(t *testing.T) {
 				t.Errorf("log lacks %q: %s", line, f.logBuf.String())
 			}
 		})
+	}
+}
+
+func TestOutboundDoneReplyKeepsTextLongerThanFiveTelegramParts(t *testing.T) {
+	f := newBridgeFixture(t)
+	if err := f.opts.Set(f.ctx, domain.OptionPostsDone, string(domain.DoneReply), 1); err != nil {
+		t.Fatal(err)
+	}
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusWorking)
+	a.Kind = "opencode"
+	f.agents[a.Key] = a
+	answer := strings.TrimSpace(strings.Repeat("complete agent response\n", 1200))
+	f.replies.Set(a.Key, answer)
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusDone)})
+	f.fire(t, 1)
+
+	sent := f.tg.Sent()
+	if len(sent) != 1 {
+		t.Fatalf("long done reply sent %d messages, want one queued outgoing", len(sent))
+	}
+	if sent[0].Text != answer || sent[0].MaxParts != 0 {
+		t.Fatalf("long done reply was truncated: text length %d, want %d; max parts %d", len(sent[0].Text), len(answer), sent[0].MaxParts)
 	}
 }
 
@@ -1114,19 +1140,18 @@ func TestOutboundDoneSummaryLine(t *testing.T) {
 	for _, tc := range []struct {
 		mode domain.DoneMode
 		code bool
-		fold int
 		line string
 	}{
-		{domain.DoneScreen, true, 0, "screen posted"},
-		{domain.DoneReply, true, 20, "reply posted"},
-		{domain.DoneFormatted, false, 20, "reply posted"},
+		{domain.DoneScreen, true, "screen posted"},
+		{domain.DoneReply, true, "reply posted"},
+		{domain.DoneFormatted, false, "reply posted"},
 	} {
 		t.Run(string(tc.mode), func(t *testing.T) {
 			f, a := metaFixture(t, tc.mode)
 			f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusDone)})
 			f.fire(t, 1)
 			sent := f.tg.Sent()
-			if len(sent) != 1 || sent[0].Footer != metaLine || sent[0].Fold != tc.fold || sent[0].Code != tc.code {
+			if len(sent) != 1 || sent[0].Footer != metaLine || sent[0].Fold != 0 || sent[0].Code != tc.code {
 				t.Fatalf("Sent = %+v", sent)
 			}
 			logs := f.logBuf.String()
@@ -1172,7 +1197,7 @@ func TestOutboundDoneSummaryLineOff(t *testing.T) {
 	}
 	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusDone)})
 	f.fire(t, 1)
-	if sent := f.tg.Sent(); len(sent) != 1 || sent[0].Footer != "" || sent[0].Text != "Done. **All** tests pass." || sent[0].Fold != 20 {
+	if sent := f.tg.Sent(); len(sent) != 1 || sent[0].Footer != "" || sent[0].Text != "Done. **All** tests pass." || sent[0].Fold != 0 {
 		t.Fatalf("Sent = %+v", sent)
 	}
 	if !strings.Contains(f.logBuf.String(), `"msg":"reply posted"`) || strings.Contains(f.logBuf.String(), `"msg":"turn meta"`) {

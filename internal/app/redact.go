@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"html"
 	"log/slog"
 	"regexp"
@@ -103,6 +104,25 @@ func (g *redactingGateway) Send(ctx context.Context, out domain.Outgoing) (int, 
 	return g.TelegramGateway.Send(ctx, out)
 }
 
+func (g *redactingGateway) SendGuard(ctx context.Context, out domain.Outgoing, guard domain.DispatchGuard) (int, error) {
+	r := g.begin()
+	out.Text = r.markup(out.Text, out.HTML)
+	out.Footer = r.text(out.Footer)
+	out.Buttons = r.buttons(out.Buttons)
+	g.report(out.ThreadID, "send", r)
+	if tg, ok := g.TelegramGateway.(interface {
+		SendGuard(context.Context, domain.Outgoing, domain.DispatchGuard) (int, error)
+	}); ok {
+		return tg.SendGuard(ctx, out, guard)
+	}
+	call, release, err := guard(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return g.TelegramGateway.Send(call, out)
+}
+
 // SendDirect carries the pager's HTML, so it is masked between tags like
 // Send.
 func (g *redactingGateway) SendDirect(ctx context.Context, userID int64, out domain.Outgoing) (int, error) {
@@ -121,6 +141,27 @@ func (g *redactingGateway) SendDocument(ctx context.Context, doc domain.Document
 	doc.Name = r.text(doc.Name)
 	g.report(doc.ThreadID, "document", r)
 	return g.TelegramGateway.SendDocument(ctx, doc)
+}
+
+func (g *redactingGateway) SendDocumentGuard(ctx context.Context, doc domain.Document, guard domain.DispatchGuard) error {
+	r := g.begin()
+	doc.Data = []byte(r.text(string(doc.Data)))
+	doc.Caption, doc.Name = r.text(doc.Caption), r.text(doc.Name)
+	if len(doc.Data) > telegramDocumentLimit {
+		return errors.New("document exceeds Telegram's 50 MB bot limit")
+	}
+	g.report(doc.ThreadID, "document", r)
+	if tg, ok := g.TelegramGateway.(interface {
+		SendDocumentGuard(context.Context, domain.Document, domain.DispatchGuard) error
+	}); ok {
+		return tg.SendDocumentGuard(ctx, doc, guard)
+	}
+	call, release, err := guard(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return g.TelegramGateway.SendDocument(call, doc)
 }
 
 func (g *redactingGateway) EditText(ctx context.Context, messageID int, text string, html bool, buttons []domain.Button) error {

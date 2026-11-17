@@ -106,6 +106,11 @@ type outbound struct {
 	// the notice for this streak already went out. A readable reply clears
 	// the state.
 	unreadable map[domain.Key]unreadableState
+	// replyEnqueue is installed by Bridge.Run. Direct outbound users keep
+	// synchronous delivery; the bridge queues transcript replies off its loop.
+	replyEnqueue  func(ownerReply) error
+	queuedReplies map[domain.Key]string
+	replyRevision map[domain.Key]uint64
 }
 
 // unreadableState is one agent's streak, see outbound.unreadable.
@@ -259,6 +264,8 @@ func newOutbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, chatID in
 		typing:       map[domain.Key]typingWait{},
 
 		pendingReplies: map[domain.Key]pendingReply{},
+		queuedReplies:  map[domain.Key]string{},
+		replyRevision:  map[domain.Key]uint64{},
 	}
 }
 
@@ -433,6 +440,7 @@ func (o *outbound) Observe(ev AgentEvent) {
 		o.reassociateState(*ev.ReassociatedFrom, ev.Agent)
 	}
 	if ev.Kind == AgentGone {
+		o.topics.invalidate(key)
 		delete(o.threads, key)
 	} else {
 		if entry, ok := o.topics.Entry(key); ok {
@@ -527,6 +535,8 @@ func (o *outbound) reassociateState(from domain.Key, next domain.Agent) {
 // Forget drops everything kept for an exited agent: the pending timer, the
 // duplicate hash and the keyboard under its last question.
 func (o *outbound) Forget(ctx context.Context, key domain.Key) error {
+	o.replyRevision[key]++
+	delete(o.queuedReplies, key)
 	o.deb.Cancel(key)
 	o.turnDeb.Cancel(key)
 	delete(o.lastPosted, key)
@@ -745,14 +755,15 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force, idleCompleti
 	if o.lastPosted[key] == hash && !force {
 		return o.skip(key, "duplicate")
 	}
+	if o.queuedReplies[key] == hash && !force {
+		return o.skip(key, "reply_queued")
+	}
 	if err := o.retire(ctx, key, "superseded"); err != nil {
 		return err
 	}
 	out := domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: mode != domain.DoneFormatted, Markdown: mode == domain.DoneFormatted, Notify: notify, Footer: footer}
-	if mode != domain.DoneScreen {
-		out.MaxParts = replyMaxParts
-		out.Fold = o.fold()
-	}
+	// Agent output is always delivered in normal messages. Telegram's
+	// expandable quote obscures long responses and their code formatting.
 	var dialog domain.Dialog
 	if status == domain.StatusBlocked {
 		dialog = domain.ParseDialog(text).ForKind(agent.Kind)
@@ -765,10 +776,21 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force, idleCompleti
 	if paged {
 		out.Notify = false
 	}
+	if mode != domain.DoneScreen && o.replyEnqueue != nil {
+		revision := o.replyRevision[key] + 1
+		if err := o.replyEnqueue(ownerReply{key: key, hash: hash, out: out, revision: revision}); err != nil {
+			return fmt.Errorf("queue owner reply for %s: %w", key.String(), err)
+		}
+		o.replyRevision[key] = revision
+		o.queuedReplies[key] = hash
+		return nil
+	}
 	id, err := o.tg.Send(ctx, out)
 	if err != nil {
 		return o.sendFailed(key, err)
 	}
+	o.replyRevision[key]++
+	delete(o.queuedReplies, key)
 	o.lastPosted[key] = hash
 	if unreadableFallback {
 		// The fallback post is on its way: this read failure counts.
@@ -1018,6 +1040,8 @@ func (o *outbound) refreshKeyboard(ctx context.Context, key domain.Key, msgID, l
 	kb.choices, kb.textEntry, kb.textLabel = d.Choices, d.TextEntry, d.TextLabel
 	kb.cursor, kb.submitRow = d.Cursor, d.SubmitRow
 	o.keyboards[key] = kb
+	o.replyRevision[key]++
+	delete(o.queuedReplies, key)
 	o.lastPosted[key] = hashText(text)
 	o.log.Debug("keyboard refreshed", slog.String("key", key.String()), slog.Int("message_id", msgID),
 		slog.Int("choices", len(d.Choices)), slog.Int("bytes", len(text)))
@@ -1418,7 +1442,7 @@ func (o *outbound) Screen(ctx context.Context, key domain.Key, lines int) error 
 			return err
 		}
 		if hasReply {
-			if _, err := o.tg.Send(ctx, domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Markdown: true, MaxParts: replyMaxParts}); err != nil {
+			if err := o.sendRequested(ctx, key, domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Markdown: true}); err != nil {
 				return err
 			}
 			o.log.Info("screen posted", slog.String("key", key.String()), slog.Int("thread_id", entry.ThreadID),
@@ -1434,12 +1458,20 @@ func (o *outbound) Screen(ctx context.Context, key domain.Key, lines int) error 
 	if text == "" {
 		text = "(screen is empty)"
 	}
-	if _, err := o.tg.Send(ctx, domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: true}); err != nil {
+	if err := o.sendRequested(ctx, key, domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: true}); err != nil {
 		return err
 	}
 	o.log.Info("screen posted", slog.String("key", key.String()), slog.Int("thread_id", entry.ThreadID),
 		slog.String("status", "requested"), slog.Int("lines", strings.Count(text, "\n")+1), slog.Int("bytes", len(text)))
 	return nil
+}
+
+func (o *outbound) sendRequested(ctx context.Context, key domain.Key, out domain.Outgoing) error {
+	if o.replyEnqueue != nil {
+		return o.replyEnqueue(ownerReply{key: key, out: out})
+	}
+	_, err := o.tg.Send(ctx, out)
+	return err
 }
 
 // screenReplyKind reports whether a bare /screen posts the agent's reply
@@ -1562,8 +1594,7 @@ func (o *outbound) ScreenAll(ctx context.Context, key domain.Key) error {
 	text := o.clean(key, strings.Join(lines, "\n"))
 	if text == "" {
 		o.log.Debug("screen all empty", slog.String("key", key.String()), slog.Bool("marked", marked))
-		_, err := o.tg.Send(ctx, domain.Outgoing{ThreadID: entry.ThreadID, Text: "(no output since your last message)"})
-		return err
+		return o.sendRequested(ctx, key, domain.Outgoing{ThreadID: entry.ThreadID, Text: "(no output since your last message)"})
 	}
 	since := "your last message"
 	if !marked {
@@ -1579,9 +1610,13 @@ func (o *outbound) ScreenAll(ctx context.Context, key domain.Key) error {
 			Data:     []byte(text + "\n"),
 			Caption:  fmt.Sprintf("%d lines since %s", n, since),
 		}
-		err = o.tg.SendDocument(ctx, doc)
+		if o.replyEnqueue != nil {
+			err = o.replyEnqueue(ownerReply{key: key, out: domain.Outgoing{ThreadID: entry.ThreadID}, document: &doc})
+		} else {
+			err = o.tg.SendDocument(ctx, doc)
+		}
 	} else {
-		_, err = o.tg.Send(ctx, domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: true})
+		err = o.sendRequested(ctx, key, domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: true})
 	}
 	if err != nil {
 		return err

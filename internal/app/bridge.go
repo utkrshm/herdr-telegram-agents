@@ -27,10 +27,14 @@ type Bridge struct {
 	in                *inbound
 	// jobs carries agent state. control preserves the order of
 	// operator actions and asynchronous results under load.
-	jobs        chan any
-	control     chan any
-	privateJobs chan any
-	PrivateBusy func(int64)
+	jobs               chan any
+	control            chan any
+	privateJobs        chan any
+	ownerReplies       chan ownerReply
+	ownerReplySlots    chan struct{}
+	ownerNoticeSlot    chan struct{}
+	failedOwnerReplies []ownerReplyResult // bridge-owned, independently bounded quarantine
+	PrivateBusy        func(int64)
 	// fatal carries the first fatal error; the daemon reads it once.
 	fatal   chan error
 	dropped atomic.Int64
@@ -59,9 +63,10 @@ func (b *Bridge) RestoreUpdate(job domain.UpdateJob) {
 // agent's transcript for done posts, git for /git and the inbox for
 // attachments. A nil member disables that feature with a notice.
 type Services struct {
-	Replies domain.ReplySource
-	Git     domain.GitRunner
-	Inbox   domain.InboxStore
+	Replies          domain.ReplySource
+	ExportTranscript func(context.Context, domain.Agent) ([]byte, error)
+	Git              domain.GitRunner
+	Inbox            domain.InboxStore
 	// Config saves config.json when /observers changes the observer list;
 	// nil refuses the change with a notice.
 	Config        domain.ConfigStore
@@ -90,14 +95,17 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 	out := newOutbound(herdr, tg, cfg.ChatID, cfg.OperatorIDs, topics, registry.Agent, registry.Live, capture, opts, svc.Replies, clock, log)
 	in := newInbound(herdr, tg, topics, registry.Agent, registry.Live, out, opts, svc, cfg, clock, log)
 	b := &Bridge{
-		out:         out,
-		in:          in,
-		jobs:        make(chan any, bridgeBuffer),
-		control:     make(chan any, bridgeBuffer),
-		privateJobs: make(chan any, 32),
-		fatal:       make(chan error, 1),
-		log:         log,
-		CallTimeout: bridgeCallTimeout,
+		out:             out,
+		in:              in,
+		jobs:            make(chan any, bridgeBuffer),
+		control:         make(chan any, bridgeBuffer),
+		privateJobs:     make(chan any, 32),
+		ownerReplies:    make(chan ownerReply, ownerReplyCapacity),
+		ownerReplySlots: make(chan struct{}, ownerReplyCapacity),
+		ownerNoticeSlot: make(chan struct{}, 1),
+		fatal:           make(chan error, 1),
+		log:             log,
+		CallTimeout:     bridgeCallTimeout,
 	}
 	in.panel.chatID, in.panel.operators = cfg.ChatID, append([]int64(nil), cfg.OperatorIDs...)
 	in.panel.updates, in.panel.jobs = svc.Updates, svc.UpdateJobs
@@ -221,7 +229,7 @@ func (b *Bridge) SubmitContext(ctx context.Context, job any) error {
 	switch job.(type) {
 	case AgentEvent:
 		queue = b.jobs
-	case privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, updateCheckResult, updateStartResult:
+	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, updateCheckResult, updateStartResult:
 		queue = b.control
 	default:
 		b.log.Warn("bridge job of unknown type dropped", slog.String("type", fmt.Sprintf("%T", job)))
@@ -261,6 +269,9 @@ func (b *Bridge) Run(ctx context.Context) {
 		b.log.Info("[FIX] bridge stopped", slog.Int64("handled", b.handled.Load()), slog.Int64("dropped", b.dropped.Load()))
 	}()
 	b.runCtx = ctx
+	b.out.replyEnqueue = b.enqueueOwnerReply
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.runOwnerReplies(ctx) }()
 	defer b.wg.Wait()
 	var privateTick <-chan time.Time
 	if b.PrivateControl != nil {
@@ -339,6 +350,22 @@ func (b *Bridge) Run(ctx context.Context) {
 
 func (b *Bridge) handle(ctx context.Context, job any) {
 	switch j := job.(type) {
+	case ownerReplyResult:
+		<-b.ownerReplySlots
+		if j.err != nil {
+			b.quarantineOwnerReply(j)
+			b.run(ctx, "owner_reply", func(context.Context) error { return j.err })
+			return
+		}
+		if j.reply.hash == "" {
+			return
+		}
+		if b.out.queuedReplies[j.reply.key] == j.reply.hash && b.out.replyRevision[j.reply.key] == j.reply.revision {
+			delete(b.out.queuedReplies, j.reply.key)
+			if j.reply.generation.ctx.Err() == nil {
+				b.out.lastPosted[j.reply.key] = j.reply.hash
+			}
+		}
 	case privateResult:
 		if j.run != nil {
 			b.run(ctx, "private_result", j.run)
@@ -429,7 +456,17 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 
 // run executes one job under the call timeout and applies the error policy.
 func (b *Bridge) run(ctx context.Context, kind string, fn func(context.Context) error) {
-	jctx, cancel := context.WithTimeout(ctx, b.CallTimeout)
+	b.runWithTimeout(ctx, kind, b.CallTimeout, fn)
+}
+
+func (b *Bridge) runWithTimeout(ctx context.Context, kind string, timeout time.Duration, fn func(context.Context) error) {
+	jctx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		jctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		jctx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 	start := time.Now()
 	err := fn(jctx)

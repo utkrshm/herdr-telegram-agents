@@ -382,7 +382,7 @@ func (p *PrivateControl) notice(ctx context.Context, e domain.PrivateMessage, te
 	return err
 }
 func (p *PrivateControl) send(ctx context.Context, o domain.ShareOrigin, text string) error {
-	_, err := p.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: text, ReplyTo: o.MessageID, MaxParts: 4}, p.Sharing.Guard(o, domain.ShareOutput))
+	_, err := p.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: text, ReplyTo: o.MessageID}, p.Sharing.Guard(o, domain.ShareOutput))
 	return err
 }
 
@@ -434,7 +434,7 @@ func (p *PrivateControl) screen(ctx context.Context, o domain.ShareOrigin, lines
 		return p.send(ctx, o, "Screen unavailable.")
 	}
 	clean, _ := domain.CutChrome(screen.Text)
-	_, err = p.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: clean, Code: true, ReplyTo: o.MessageID, MaxParts: 4}, p.Sharing.Guard(o, domain.ShareScreen))
+	_, err = p.Telegram.SendAt(ctx, o.Address, domain.Outgoing{Text: clean, Code: true, ReplyTo: o.MessageID}, p.Sharing.Guard(o, domain.ShareScreen))
 	return err
 }
 

@@ -1,10 +1,13 @@
 package telegram_test
 
 import (
+	"context"
 	"errors"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf16"
 
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/telegram"
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
@@ -31,6 +34,73 @@ func TestSendSinglePart(t *testing.T) {
 	}
 	if f.Has("reply_parameters") {
 		t.Errorf("reply_parameters sent without ReplyTo: %v", f)
+	}
+}
+
+func TestSendLiteralSuffixStaysInSource(t *testing.T) {
+	for _, text := range []string{"example\n… (0/2)", strings.Repeat("x", 4500) + "\n… (0/2)"} {
+		h := newHarness(t)
+		h.api.on("sendMessage", func(url.Values) apiReply { return okReply(map[string]any{"message_id": 1}) })
+		if _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: text, Code: true}); err != nil {
+			t.Fatal(err)
+		}
+		var content strings.Builder
+		for _, call := range h.api.callsOf("sendMessage") {
+			c, _ := codeMessageParts(call.form.Get("text"))
+			content.WriteString(c)
+		}
+		if content.String() != text {
+			t.Fatalf("source changed: got tail %q", content.String()[len(content.String())-20:])
+		}
+	}
+}
+
+func TestSendFormattedUnicodeHasBoundedParts(t *testing.T) {
+	h := newHarness(t)
+	h.api.on("sendMessage", func(url.Values) apiReply { return okReply(map[string]any{"message_id": 1}) })
+	text := strings.Repeat("🌍 world. ", 1500) + "\n… (0/2)"
+	if _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: text, Markdown: true}); err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendMessage")
+	if len(calls) < 2 {
+		t.Fatal("expected multipart")
+	}
+	var joined strings.Builder
+	for _, c := range calls {
+		body := c.form.Get("text")
+		if len(utf16.Encode([]rune(body))) > 4000 {
+			t.Fatalf("oversized formatted part: %d", len(utf16.Encode([]rune(body))))
+		}
+		idx := strings.LastIndex(body, "\n… (")
+		if idx < 0 {
+			t.Fatal("missing generated marker")
+		}
+		joined.WriteString(body[:idx])
+	}
+	if joined.String() != text {
+		t.Fatalf("formatted content changed: got %d bytes want %d", joined.Len(), len(text))
+	}
+}
+
+func TestSendGuardRechecksEveryPartAndReturnsAcknowledgedID(t *testing.T) {
+	h := newHarness(t)
+	h.api.on("sendMessage", func(url.Values) apiReply { return okReply(map[string]any{"message_id": 71}) })
+	stale := errors.New("mapping changed")
+	checks := 0
+	guard := func(ctx context.Context) (context.Context, context.CancelFunc, error) {
+		checks++
+		if checks > 1 {
+			return nil, nil, stale
+		}
+		return ctx, func() {}, nil
+	}
+	id, err := h.gw.SendGuard(h.ctx, domain.Outgoing{ThreadID: 42, Text: strings.Repeat("x", 8000)}, guard)
+	if id != 71 || !errors.Is(err, stale) {
+		t.Fatalf("SendGuard = %d, %v", id, err)
+	}
+	if calls := len(h.api.callsOf("sendMessage")); calls != 1 {
+		t.Fatalf("sent %d parts after reassignment", calls)
 	}
 }
 
@@ -102,17 +172,199 @@ func TestSendCodeAndChunks(t *testing.T) {
 	var joined []string
 	for i, c := range calls {
 		body := c.form.Get("text")
-		if !strings.HasPrefix(body, "<pre>") || !strings.HasSuffix(body, "</pre>") {
+		content, suffix := codeMessageParts(body)
+		if content == "" || !strings.Contains(body, "</pre>") {
 			t.Errorf("part %d not wrapped in <pre>: %.20q", i+1, body)
 		}
-		if strings.Contains(body, "<0>") {
+		if strings.Contains(content, "<0>") {
 			t.Errorf("part %d contains unescaped angle brackets", i+1)
 		}
-		joined = append(joined, strings.TrimSuffix(strings.TrimPrefix(body, "<pre>"), "</pre>"))
+		joined = append(joined, content)
+		if !strings.Contains(suffix, "… ("+itoa(i+1)+"/3)") {
+			t.Errorf("part %d suffix = %q", i+1, suffix)
+		}
 	}
-	if got := strings.Join(joined, "\n"); got != strings.ReplaceAll(strings.ReplaceAll(text, "<", "&lt;"), ">", "&gt;") {
+	if got := strings.Join(joined, ""); got != strings.ReplaceAll(strings.ReplaceAll(text, "<", "&lt;"), ">", "&gt;") {
 		t.Error("parts do not reassemble into the escaped text")
 	}
+}
+
+func TestSendLongCodeReplyWithoutPartCap(t *testing.T) {
+	h := newHarness(t)
+	nextID := 0
+	h.api.on("sendMessage", func(url.Values) apiReply {
+		nextID++
+		return okReply(map[string]any{"message_id": nextID})
+	})
+
+	lines := make([]string, 8)
+	for i := range lines {
+		lines[i] = strings.Repeat(string(rune('a'+i)), 4032)
+	}
+	text := strings.Join(lines, "\n")
+	id, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: text, Code: true})
+	if err != nil {
+		t.Fatalf("Send = %d, %v", id, err)
+	}
+
+	calls := h.api.callsOf("sendMessage")
+	if len(calls) <= 5 {
+		t.Fatalf("send count = %d, want more than five parts", len(calls))
+	}
+	parts := make([]string, 0, len(calls))
+	for i, call := range calls {
+		body := call.form.Get("text")
+		content, suffix := codeMessageParts(body)
+		if !strings.Contains(body, "</pre>") {
+			t.Fatalf("part %d is not a complete code block", i+1)
+		}
+		if !strings.Contains(suffix, "… (") {
+			t.Fatalf("part %d has no response marker", i+1)
+		}
+		parts = append(parts, content)
+	}
+	want := strings.ReplaceAll(strings.ReplaceAll(text, "<", "&lt;"), ">", "&gt;")
+	if got := strings.Join(parts, ""); got != want {
+		t.Fatalf("reassembled %d characters, want %d; got tail %q, want tail %q", len(got), len(want), got[len(got)-20:], want[len(want)-20:])
+	}
+}
+
+func TestSendUnicodeResponsePartsStayWithinFourThousandUTF16Units(t *testing.T) {
+	h := newHarness(t)
+	nextID := 0
+	h.api.on("sendMessage", func(url.Values) apiReply {
+		nextID++
+		return okReply(map[string]any{"message_id": nextID})
+	})
+	text := strings.Repeat("🌍", 50000)
+	if _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: text, Code: true}); err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendMessage")
+	if len(calls) <= 20 {
+		t.Fatalf("parts = %d, want more than twenty", len(calls))
+	}
+	var rebuilt strings.Builder
+	for i, call := range calls {
+		body := call.form.Get("text")
+		content, suffix := codeMessageParts(body)
+		if units := len(utf16.Encode([]rune(content + suffix))); units > 4000 {
+			t.Errorf("part %d uses %d UTF-16 units including suffix; want <= 4000", i+1, units)
+		}
+		rebuilt.WriteString(content)
+		wantSuffix := "… (" + itoa(i+1) + "/" + itoa(len(calls)) + ")"
+		if !strings.HasSuffix(suffix, wantSuffix) {
+			t.Errorf("part %d suffix = %q, want %q", i+1, suffix, wantSuffix)
+		}
+	}
+	if rebuilt.String() != text {
+		t.Fatalf("unicode response changed during split/reassembly: got %d runes, want %d", len([]rune(rebuilt.String())), len([]rune(text)))
+	}
+}
+
+func TestSendPrefersSentenceBoundaryWhenSplitting(t *testing.T) {
+	h := newHarness(t)
+	nextID := 0
+	h.api.on("sendMessage", func(url.Values) apiReply {
+		nextID++
+		return okReply(map[string]any{"message_id": nextID})
+	})
+	first := strings.Repeat("first sentence ", 220) + "done. "
+	second := strings.Repeat("second sentence ", 220) + "done."
+	text := first + second
+	if _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendMessage")
+	if len(calls) != 2 {
+		t.Fatalf("parts = %d, want two sentence-sized parts", len(calls))
+	}
+	firstPart := stripResponseSuffix(calls[0].form.Get("text"))
+	if !strings.HasSuffix(firstPart, ".") {
+		t.Fatalf("first part ended mid-sentence: %q", firstPart[len(firstPart)-40:])
+	}
+	joined := stripResponseSuffix(calls[0].form.Get("text")) + stripResponseSuffix(calls[1].form.Get("text"))
+	if joined != text {
+		t.Fatal("sentence split changed or dropped source text")
+	}
+}
+
+func TestSendLongReplyAfterQueueWindowIsPreused(t *testing.T) {
+	h := newHarness(t)
+	nextID := 0
+	h.api.on("sendMessage", func(url.Values) apiReply {
+		nextID++
+		return okReply(map[string]any{"message_id": nextID})
+	})
+
+	// Spend the whole per-minute allowance before beginning the long reply.
+	for i := 0; i < 20; i++ {
+		if _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: "prior"}); err != nil {
+			t.Fatalf("preuse send %d: %v", i+1, err)
+		}
+	}
+	lines := make([]string, 24)
+	for i := range lines {
+		lines[i] = strings.Repeat(string(rune('a'+i%26)), 4032)
+	}
+	text := strings.Join(lines, "\n")
+	guardCalls := 0
+	guard := func(ctx context.Context) (context.Context, context.CancelFunc, error) {
+		guardCalls++
+		return ctx, func() {}, nil
+	}
+	id, err := h.gw.SendAt(h.ctx, domain.TopicAddress{ChatID: testChatID, ThreadID: 42}, domain.Outgoing{Text: text, Code: true}, guard)
+	if err != nil {
+		t.Fatalf("long SendAt = %d, %v", id, err)
+	}
+	calls := h.api.callsOf("sendMessage")
+	partCount := len(calls) - 20
+	if partCount <= 20 {
+		t.Fatalf("long response split into %d parts, want more than 20", partCount)
+	}
+	if id != len(calls) {
+		t.Fatalf("final id = %d, want %d", id, len(calls))
+	}
+	if guardCalls != partCount {
+		t.Fatalf("dispatch guard called %d times, want once per output part (%d)", guardCalls, partCount)
+	}
+	parts := make([]string, 0, len(lines))
+	for _, call := range calls[20:] {
+		body := call.form.Get("text")
+		content, _ := codeMessageParts(body)
+		parts = append(parts, content)
+	}
+	if got := strings.Join(parts, ""); got != text {
+		t.Fatalf("reassembled long reply length %d, want %d; tail was lost or duplicated", len(got), len(text))
+	}
+	waits := h.sleep.recorded()
+	foundWindowWait := false
+	for _, wait := range waits {
+		if wait >= 40*time.Second {
+			foundWindowWait = true
+			break
+		}
+	}
+	if !foundWindowWait {
+		t.Fatalf("queue did not enforce the preused per-minute window; waits = %v", waits)
+	}
+}
+
+func codeMessageParts(body string) (string, string) {
+	content := strings.TrimPrefix(body, "<pre>")
+	close := strings.Index(content, "</pre>")
+	if close < 0 {
+		return content, ""
+	}
+	return content[:close], content[close+len("</pre>"):]
+}
+
+func stripResponseSuffix(text string) string {
+	index := strings.LastIndex(text, "\n… (")
+	if index < 0 || !strings.HasSuffix(text, ")") {
+		return text
+	}
+	return text[:index]
 }
 
 func TestSendStopsAtFirstFailure(t *testing.T) {
@@ -515,7 +767,7 @@ func TestSendMaxPartsTrailer(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("calls = %d, want 2", len(calls))
 	}
-	if got := calls[1].form.Get("text"); !strings.HasSuffix(got, "\n… (+10 chars)</pre>") {
+	if got := calls[1].form.Get("text"); !strings.HasSuffix(got, "… (+107 chars)") || !strings.Contains(got, "</pre>\n… (2/2)") {
 		t.Errorf("last part = %.40q (tail %q)", got, got[len(got)-30:])
 	}
 	if got := calls[0].form.Get("text"); strings.Contains(got, "chars)") {
@@ -573,8 +825,12 @@ func TestSendMarkdownFenceAcrossParts(t *testing.T) {
 		if strings.Contains(body, "```") {
 			t.Errorf("part %d leaks a raw fence", i+1)
 		}
+		wantSuffix := "… (" + itoa(i+1) + "/" + itoa(len(calls)) + ")"
+		if !strings.Contains(body, wantSuffix) {
+			t.Errorf("part %d lacks remaining/total suffix %q: tail %q", i+1, wantSuffix, body[max(0, len(body)-100):])
+		}
 	}
-	if !strings.HasSuffix(calls[len(calls)-1].form.Get("text"), "</code></pre>\ndone") {
+	if !strings.HasSuffix(calls[len(calls)-1].form.Get("text"), "</code></pre>\ndone\n… (4/4)") {
 		t.Errorf("last part = %q", calls[len(calls)-1].form.Get("text"))
 	}
 }
@@ -632,11 +888,11 @@ func TestSendFooter(t *testing.T) {
 		t.Fatalf("calls = %d, want 3", len(calls))
 	}
 	for i, c := range calls[:2] {
-		if body := c.form.Get("text"); !strings.HasSuffix(body, "</pre>") {
+		if body := c.form.Get("text"); !strings.Contains(body, "</pre>") || strings.Contains(body, "⏱") {
 			t.Errorf("part %d carries a footer: %.40q", i+1, body[len(body)-40:])
 		}
 	}
-	if body := calls[2].form.Get("text"); !strings.HasSuffix(body, "</pre>\n⏱ 4 min") {
+	if body := calls[2].form.Get("text"); !strings.HasSuffix(body, "\n⏱ 4 min") || !strings.Contains(body, "</pre>") {
 		t.Errorf("last part lacks the footer: %.40q", body[len(body)-40:])
 	}
 	// The footer is escaped, and a long one is cut to 200 units.
