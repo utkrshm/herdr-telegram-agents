@@ -98,7 +98,9 @@ func (e *OpenCodeExporter) Export(ctx context.Context, sessionID string) ([]byte
 		return nil, fmt.Errorf("opencode export: invalid session id")
 	}
 	dbFallback := ""
-	if out, err := e.exportFromDB(ctx, sessionID); err == nil {
+	if e.sqlite == nil {
+		// Full transcript exports must not use the last-turn database shortcut.
+	} else if out, err := e.exportFromDB(ctx, sessionID); err == nil {
 		return out, nil
 	} else if parentErr := ctx.Err(); parentErr != nil {
 		return nil, fmt.Errorf("opencode export: %w", parentErr)
@@ -168,6 +170,16 @@ func (e *OpenCodeExporter) Export(ctx context.Context, sessionID string) ([]byte
 		return nil, fmt.Errorf("opencode export: exit code %d", exitCode)
 	}
 	return nil, fmt.Errorf("opencode export: start or wait failed")
+}
+
+// ExportFull uses the CLI rather than the last-turn database shortcut. The
+// JSON limit is independent of Telegram's smaller document limit.
+func (e *OpenCodeExporter) ExportFull(ctx context.Context, sessionID string) ([]byte, error) {
+	full := *e
+	full.sqlite = nil
+	full.maxBytes = 64 << 20
+	full.timeout = 40 * time.Second
+	return full.Export(ctx, sessionID)
 }
 
 // runExport runs opencode with args, its stdout in a fresh export file.

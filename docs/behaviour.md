@@ -511,7 +511,8 @@ option of the Posts group:
   `- ` lists become `•`, quotes get a bar, `[text](url)` becomes a link,
   inline code and fenced blocks keep their monospace, pipe tables are
   monospaced too. A fenced block never straddles two messages; long replies
-  are split and stop after five messages with `… (+N chars)` at the end.
+  are split into Telegram-sized messages with a remaining/total marker on
+  each part; the full reply has no five-message cap.
   Should Telegram reject the markup (`can't parse entities`), that part is
   sent once more as a plain code block and the log says so. An agent with
   no readable reply (any kind other than Claude Code, Codex, OpenCode,
@@ -587,11 +588,24 @@ Blocked posts are never affected: the dialog
 with its buttons exists only on the screen. For an idle or done OpenCode, Codex, Antigravity, Pi or Muse agent,
 a bare `/screen` tries the current session reply, rendered like `Formatted`,
 whatever `Done post` says. It falls back to the screen when the reply is
-unavailable, empty, or stale. The reply stops after five Telegram messages
-with a truncation trailer. Claude Code and other agents keep the visible
+unavailable, empty, or stale. Long replies are split into Telegram-sized
+messages with no part-count cap. Claude Code and other agents keep the visible
 screen for `/screen`; `/screen N` always reads the screen, and `/screen all`
 uses captured history (see [commands](commands.md)). None of these commands
 carries the summary line or the fold.
+
+Owner transcript replies and requested screens are delivered by a bounded
+background queue, so sending a long response does not hold the command loop.
+Multipart messages show the remaining/total count. A changed topic assignment
+cancels parts not yet dispatched. A failed delivery is not blindly retried:
+the daemon retains the reply and last acknowledged message in an in-memory
+quarantine, reports the failure in General when possible, and continues with
+other queued replies. Quarantine and pending replies do not survive a restart;
+check the agent transcript and daemon logs to recover missing output. The
+queue and quarantine each have 32 slots, with a 4 MiB limit per item. Failed
+items release queue capacity; when quarantine fills, the oldest failure is
+evicted and reported in the logs and, when possible, in General. When the
+queue is full, new output is refused and reported rather than silently discarded.
 
 ## Turns and reactions
 
@@ -662,7 +676,7 @@ The options today:
 | `Hold topic edits` | Quiet | Default on. While at the desk no topic is created, renamed, closed, reopened or given a new icon; each of those is a Telegram service message that rings the phone. Off keeps topic edits live while at the desk. |
 | `Screen posts` | Quiet | Default `Silent`. What happens to blocked and done screens while at the desk: `Silent` posts without a sound (Telegram still shows a silent banner), `Held` posts nothing until you leave, `Normal` posts as usual. |
 | `Re-announce on leaving` | Quiet | Default on. When you leave, the screen of every agent still waiting for an answer is posted again with a sound, once per question. Off: only agents that have no post at all yet are posted. |
-| `Done post` | Posts | Default `Formatted`. What a topic receives when its agent finishes: `Screen` posts the last 12 terminal lines in monospace; `Reply` posts the agent's last message from its Claude Code transcript (`~/.claude/projects/<cwd slug>/`, newest session file) in monospace; `Formatted` renders that message: headings and bold, `•` lists, links, inline and fenced code, tables in monospace. A reply longer than five messages is cut with `… (+N chars)`. For OpenCode the message comes from the CLI export for the pane's session; for Codex it is the final answer of the last completed turn, read from the pane's rollout file. Falls back to `Screen` for other agents or when no reply is found, see [Done posts](#done-posts). |
+| `Done post` | Posts | Default `Formatted`. What a topic receives when its agent finishes: `Screen` posts the last 12 terminal lines in monospace; `Reply` posts the agent's last message from its Claude Code transcript (`~/.claude/projects/<cwd slug>/`, newest session file) in monospace; `Formatted` renders that message: headings and bold, `•` lists, links, inline and fenced code, tables in monospace. Long replies are split into Telegram-sized parts without a five-message cap. For OpenCode the message comes from the CLI export for the pane's session; for Codex it is the final answer of the last completed turn, read from the pane's rollout file. Falls back to `Screen` for other agents or when no reply is found, see [Done posts](#done-posts). |
 | `Turn summary line` | Posts | Default on. Every done post (`Screen`, `Reply` and `Formatted`) ends with one line from the agent's transcript: `⏱ 4 min · fable-5-1 · ✏️ 3 files · ↑ 12k tokens` (turn duration, model, distinct files edited, output tokens). Claude Code, OpenCode and Codex only (no file count for Codex); without a transcript the post ends as before and the log has `turn meta unavailable` at debug. A transcript written before the turn began is skipped. Off: no line and, in `Screen` mode, no transcript read. See [Done posts](#done-posts). |
 | `Fold long replies after` | Posts | Default `20 lines`. A `Reply` or `Formatted` done post whose message part has more lines than this arrives collapsed in Telegram's expandable quote: the first lines and an arrow that opens the rest; the summary line stays visible under it. `Off` never folds; `Screen` posts are never folded. Any integer of lines up to 1000 can be typed into `options.json`. See [Done posts](#done-posts). |
 | `Trim the input frame` | Posts | Default on. Every screen post (done and blocked screens, `/screen`, `/screen all`, the tails of the Claude Code commands, the pager's six lines) loses Claude Code's input frame at the bottom: the `─` rule, the empty `❯` row, the second rule, the status line (`… │ main ✓ │ 14%: …`) and the mode hint (`⏵⏵ auto mode on (shift+tab to cycle)` or `? for shortcuts`). The cut walks up from the bottom and stops at the first line that is none of these, so a dialog and its options are never touched, a `❯` row with typed text is left alone and a screen without the frame (Codex, any other agent) passes through unchanged. The duplicate check runs after the cut, so a screen that differs only in the status line's clock is not posted twice. Off posts the screen as captured. |

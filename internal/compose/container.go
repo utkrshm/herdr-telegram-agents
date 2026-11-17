@@ -476,11 +476,12 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 	// One exporter serves the topic posts and the private mirror; its export
 	// files live under the state dir, and a crash's leftovers go now.
 	system.SweepOpenCodeExports(env.StateDir, log)
-	openCodeExport := system.NewOpenCodeExporter(env.StateDir, log).Export
+	exporter := system.NewOpenCodeExporter(env.StateDir, log)
+	openCodeExport := exporter.Export
 	// The Muse reader ties a pane's pids to their process start times.
 	started := system.NewProcess(env.StateDir, log).StartTime
 	bridge := app.NewBridge(cfg, hg, tg, registry, reconciler, capture, opts,
-		app.Services{Replies: replySources(hg.AgentSessions, hg.AgentSession, openCodeExport, hg.PaneProcesses, started, log), Git: system.NewGitRunner(log), Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log),
+		app.Services{Replies: replySources(hg.AgentSessions, hg.AgentSession, openCodeExport, hg.PaneProcesses, started, log), ExportTranscript: transcript.NewOpenCodeReader(hg.AgentSession, exporter.ExportFull, log).Transcript, Git: system.NewGitRunner(log), Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log),
 			Updates: BuildUpdateManager(env, log), UpdateJobs: state.NewUpdateStore(env.StateDir, log),
 			LaunchUpdate:  func(ctx context.Context, id string) (int, error) { return LaunchUpdateWorker(ctx, env, id, log) },
 			UpdateRunning: func() bool { return BuildSupervisor(env, log).Status().Running }}, clock, log)

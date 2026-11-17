@@ -282,8 +282,8 @@ func buildOptionSpecs() []OptionSpec {
 		},
 		// Formatted by default since 2026-10-01: the rendered last reply
 		// reads best on a phone. It adds no notification: done posts are
-		// silent, a reply is capped at five messages and folded after
-		// posts.fold lines, and an agent without a readable transcript
+		// silent, a reply is split into Telegram-sized messages and folded
+		// after posts.fold lines, and an agent without a readable transcript
 		// gets the screen as before.
 		{
 			Key:         OptionPostsDone,

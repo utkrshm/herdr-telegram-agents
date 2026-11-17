@@ -19,6 +19,7 @@ const (
 	// screen, otherwise the last Lines lines; All means the output since
 	// the last human message.
 	CmdScreen CommandKind = "screen"
+	CmdExport CommandKind = "export"
 	// CmdFocus brings the agent's pane to the front in Herdr.
 	CmdFocus CommandKind = "focus"
 	// CmdStatus answers with the agent status (topic) or a summary of every
@@ -450,6 +451,8 @@ func ParseCommand(text, botUsername string) Command {
 		return Command{Kind: CmdShares, Text: rest}
 	case "screen":
 		return parseScreen(args)
+	case "export":
+		return bareCommand(CmdExport, word, args)
 	case "keys":
 		if len(args) == 0 {
 			return Command{Kind: CmdUnknown, Text: "/keys"}

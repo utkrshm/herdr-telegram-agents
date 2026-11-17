@@ -18,7 +18,8 @@ import (
 
 // helpText is the command list shown by /help in a topic and in General.
 const helpText = `Commands
-/screen [N|all]: for idle or done OpenCode, Codex, Antigravity, Pi or Muse, post its last reply when available (up to 5 messages); otherwise the visible screen; with N the screen's last N lines, with "all" everything since your last message
+/screen [N|all]: for idle or done OpenCode, Codex, Antigravity, Pi or Muse, post its complete last reply when available; otherwise the visible screen; with N the screen's last N lines, with "all" everything since your last message
+/export: export the OpenCode session's user and assistant text as a Markdown file (topic only)
 /keys k1 k2 ...: send raw keys to the agent (esc, enter, y, 1 ...)
 /focus: bring the agent's pane to the front in Herdr
 /git status | diff [staged] | log [N]: git in the agent's directory; long output arrives as a file
@@ -150,8 +151,9 @@ type inbound struct {
 	pickers map[domain.Key]heldPicker
 	// git runs /git in the agent's directory; inbox keeps attachments.
 	// Either may be nil, which refuses the feature with a notice.
-	git   domain.GitRunner
-	inbox domain.InboxStore
+	git              domain.GitRunner
+	inbox            domain.InboxStore
+	exportTranscript func(context.Context, domain.Agent) ([]byte, error)
 	// closing is the message id of the active /close question per agent;
 	// a newer question retires the older one. Bridge goroutine only.
 	closing map[domain.Key]int
@@ -199,7 +201,7 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 	}
 	in := &inbound{
 		herdr: herdr, tg: tg, topics: topics, agents: agents, live: live, out: out,
-		git: svc.Git, inbox: svc.Inbox,
+		git: svc.Git, inbox: svc.Inbox, exportTranscript: svc.ExportTranscript,
 		opts: opts, panel: newPanel(opts, tg, log),
 		cfg: cfg, store: svc.Config, log: log,
 		chrome:  opts.PostsChrome,
@@ -316,6 +318,8 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		})
 	case domain.CmdGit:
 		return i.gitCommand(ctx, msg, key, agent, cmd.Git)
+	case domain.CmdExport:
+		return i.exportCommand(ctx, msg, key, agent)
 	case domain.CmdStop:
 		i.releasePicker(key, "stop")
 		return i.control(ctx, msg, key, "stop", domain.KeyEscape, stoppedReply)
@@ -706,7 +710,7 @@ func (i *inbound) HandleGeneral(ctx context.Context, cmd domain.GeneralCommand) 
 		return i.reply(ctx, 0, cmd.MessageID, topicOnly)
 	case domain.CmdNew:
 		return i.startAgent(ctx, cmd, parsed)
-	case domain.CmdGit:
+	case domain.CmdGit, domain.CmdExport:
 		return i.reply(ctx, 0, cmd.MessageID, topicOnly)
 	case domain.CmdObservers:
 		return i.observers(ctx, cmd, parsed.Observers)
