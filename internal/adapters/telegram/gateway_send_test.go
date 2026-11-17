@@ -3,8 +3,10 @@ package telegram_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -499,6 +501,94 @@ func TestSendDocumentToGeneralAndErrors(t *testing.T) {
 	err := h.gw.SendDocument(h.ctx, domain.Document{ThreadID: 9, Name: "x.txt", Data: []byte("x"), Caption: "fail"})
 	if !errors.Is(err, domain.ErrTopicGone) {
 		t.Fatalf("err = %v, want ErrTopicGone", err)
+	}
+}
+
+func TestSendPhotoInlineToTopic(t *testing.T) {
+	h := newHarness(t)
+	h.api.on("sendPhoto", func(url.Values) apiReply { return okReply(map[string]any{"message_id": 7}) })
+	photo := domain.Photo{ThreadID: 42, Name: "plot.png", Data: []byte("png bytes"), Caption: "chart"}
+	if err := h.gw.SendPhoto(h.ctx, photo); err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendPhoto")
+	if len(calls) != 1 {
+		t.Fatalf("sendPhoto calls=%d", len(calls))
+	}
+	call := calls[0]
+	if call.form.Get("message_thread_id") != "42" || call.form.Get("caption") != "chart" || call.form.Get("disable_notification") != "true" {
+		t.Fatalf("form=%v", call.form)
+	}
+	file, ok := call.files["photo"]
+	if !ok || file.name != photo.Name || string(file.data) != string(photo.Data) {
+		t.Fatalf("photo part=%+v", file)
+	}
+}
+
+func TestSendPhotoGuardRunsAfterQueuePacingAndRejectsChangedMapping(t *testing.T) {
+	api := newFakeAPI(t)
+	log := slog.New(slog.DiscardHandler)
+	api.on("sendMessage", func(url.Values) apiReply { return okReply(map[string]any{"message_id": 1}) })
+	entered, release := make(chan struct{}), make(chan struct{})
+	queue := telegram.NewQueue(log, telegram.QueueConfig{Sleep: func(ctx context.Context, _ time.Duration) error {
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}})
+	gw := telegram.NewGateway(api.bot(t, log, nil), telegram.Config{ChatID: testChatID}, queue, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); gw.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	if _, err := gw.Send(ctx, domain.Outgoing{ThreadID: 1, Text: "prior call"}); err != nil {
+		t.Fatal(err)
+	}
+	var mappingChanged atomic.Bool
+	result := make(chan error, 1)
+	go func() {
+		result <- gw.SendPhotoGuard(ctx, domain.Photo{ThreadID: 1, Name: "image.png", Data: []byte("image")}, func(ctx context.Context) (context.Context, context.CancelFunc, error) {
+			if mappingChanged.Load() {
+				return nil, nil, errors.New("topic mapping changed")
+			}
+			return ctx, func() {}, nil
+		})
+	}()
+	<-entered
+	mappingChanged.Store(true)
+	close(release)
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "topic mapping changed") {
+		t.Fatalf("send error=%v", err)
+	}
+	if calls := api.callsOf("sendPhoto"); len(calls) != 0 {
+		t.Fatalf("sendPhoto calls=%d", len(calls))
+	}
+}
+
+func TestPhotoMalformedAcknowledgementIsNotRetried(t *testing.T) {
+	h := newHarness(t)
+	h.api.on("sendPhoto", func(url.Values) apiReply { return okReply(map[string]any{"message_id": "malformed"}) })
+	err := h.gw.SendPhoto(h.ctx, domain.Photo{ThreadID: 42, Name: "image.png", Data: []byte("image")})
+	if err == nil {
+		t.Fatal("malformed acknowledgement unexpectedly succeeded")
+	}
+	if calls := h.api.callsOf("sendPhoto"); len(calls) != 1 {
+		t.Fatalf("sendPhoto attempts=%d, want exactly one", len(calls))
+	}
+}
+
+func TestDocumentMalformedAcknowledgementIsNotRetried(t *testing.T) {
+	h := newHarness(t)
+	h.api.on("sendDocument", func(url.Values) apiReply { return okReply(map[string]any{"message_id": "malformed"}) })
+	err := h.gw.SendOriginalDocument(h.ctx, domain.Document{ThreadID: 42, Name: "file.bin", Data: []byte{0, 0xff}}, nil)
+	if err == nil {
+		t.Fatal("malformed acknowledgement unexpectedly succeeded")
+	}
+	if calls := h.api.callsOf("sendDocument"); len(calls) != 1 {
+		t.Fatalf("sendDocument attempts=%d, want exactly one", len(calls))
 	}
 }
 

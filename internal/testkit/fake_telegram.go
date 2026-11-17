@@ -60,6 +60,7 @@ type FakeTelegram struct {
 	observers    []int64
 	pack         []string
 	docs         []domain.Document
+	photos       []domain.Photo
 	files        map[string][]byte
 	// downloadDelay makes Download sleep that long (real time) so tests
 	// can see that a download does not stall the bridge loop.
@@ -532,6 +533,50 @@ func (f *FakeTelegram) SendDocument(_ context.Context, doc domain.Document) erro
 	}
 	f.docs = append(f.docs, doc)
 	return nil
+}
+
+func (f *FakeTelegram) SendPhoto(_ context.Context, photo domain.Photo) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.record("photo", fmt.Sprintf("photo:%d:%s:%d", photo.ThreadID, photo.Name, len(photo.Data))); err != nil {
+		return err
+	}
+	if _, ok := f.topics[photo.ThreadID]; !ok {
+		return domain.ErrTopicGone
+	}
+	f.photos = append(f.photos, photo)
+	return nil
+}
+
+func (f *FakeTelegram) SendPhotoGuard(ctx context.Context, photo domain.Photo, guard domain.DispatchGuard) error {
+	if guard != nil {
+		call, release, err := guard(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		ctx = call
+	}
+	return f.SendPhoto(ctx, photo)
+}
+
+func (f *FakeTelegram) SendOriginalDocument(ctx context.Context, document domain.Document, guard domain.DispatchGuard) error {
+	if guard != nil {
+		call, release, err := guard(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+		ctx = call
+	}
+	return f.SendDocument(ctx, document)
+}
+
+// Photos returns all uploaded inline photos in order.
+func (f *FakeTelegram) Photos() []domain.Photo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.Photo(nil), f.photos...)
 }
 
 // SetFile scripts the bytes Download answers for fileID.

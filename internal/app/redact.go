@@ -143,6 +143,24 @@ func (g *redactingGateway) SendDocument(ctx context.Context, doc domain.Document
 	return g.TelegramGateway.SendDocument(ctx, doc)
 }
 
+func (g *redactingGateway) SendPhoto(ctx context.Context, photo domain.Photo) error {
+	return g.TelegramGateway.SendPhoto(ctx, photo)
+}
+
+func (g *redactingGateway) SendPhotoGuard(ctx context.Context, photo domain.Photo, guard domain.DispatchGuard) error {
+	return g.TelegramGateway.SendPhotoGuard(ctx, photo, guard)
+}
+
+// SendOriginalDocument is the explicit opt-out from text redaction for
+// user-selected original files. No caption is accepted, and bytes/name pass
+// through exactly as provided.
+func (g *redactingGateway) SendOriginalDocument(ctx context.Context, doc domain.Document, guard domain.DispatchGuard) error {
+	if len(doc.Data) > telegramDocumentLimit {
+		return errors.New("document exceeds Telegram's 50 MB bot limit")
+	}
+	return g.TelegramGateway.SendOriginalDocument(ctx, doc, guard)
+}
+
 func (g *redactingGateway) SendDocumentGuard(ctx context.Context, doc domain.Document, guard domain.DispatchGuard) error {
 	r := g.begin()
 	doc.Data = []byte(r.text(string(doc.Data)))

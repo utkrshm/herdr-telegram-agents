@@ -29,6 +29,8 @@ var documentedCommands = []struct{ name, help string }{
 	{"logs-pane", "[[panes]] overlay: tail of daemon.log"},
 	{"doctor-pane", "[[panes]] overlay: one line per diagnostic check"},
 	{"usage-tap", "--out <file>: Claude Code status line tap for the quota line"},
+	{"send-image", "[--pane <id>] <image>...: send inline photos to the requesting pane"},
+	{"send-file", "[--pane <id>] <file>...: send original documents to the requesting pane"},
 }
 
 // command is one subcommand handler. It receives the arguments after the
@@ -91,6 +93,8 @@ func commands() map[string]command {
 		"logs-pane":     runLogsPane,
 		"doctor-pane":   runDoctorPane,
 		"usage-tap":     runUsageTap,
+		"send-image":    runSendImage,
+		"send-file":     runSendFile,
 		"dev":           runDev,
 	}
 }

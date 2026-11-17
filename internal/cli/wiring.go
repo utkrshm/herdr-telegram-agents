@@ -30,6 +30,7 @@ type doctor interface {
 // defaults are the real compose functions.
 type wiring struct {
 	env             func() (compose.PluginEnv, error)
+	agentCommandEnv func() (compose.PluginEnv, error)
 	loadConfig      func(ctx context.Context, env compose.PluginEnv, log *slog.Logger) (domain.Config, error)
 	fileLogger      func(env compose.PluginEnv, configLevel string) (*slog.Logger, io.Closer, error)
 	tightenPerms    func(env compose.PluginEnv, log *slog.Logger) int
@@ -45,19 +46,21 @@ type wiring struct {
 	buildDoctor     func(env compose.PluginEnv, version string, log *slog.Logger) doctor
 	buildInspector  func(cfg domain.Config, log *slog.Logger) (domain.TelegramInspector, error)
 	sendTest        func(ctx context.Context, insp domain.TelegramInspector, version string, log *slog.Logger) (string, error)
+	sendAgentFile   func(ctx context.Context, env compose.PluginEnv, request domain.AgentFileUpload) (string, error)
 }
 
 var wire = defaultWiring()
 
 func defaultWiring() wiring {
 	return wiring{
-		env:          compose.Env,
-		loadConfig:   compose.LoadConfig,
-		fileLogger:   compose.NewFileLogger,
-		tightenPerms: compose.TightenPermissions,
-		notify:       compose.Notify,
-		pidFile:      compose.NewPidFile,
-		buildDaemon:  compose.BuildDaemon,
+		env:             compose.Env,
+		agentCommandEnv: compose.AgentCommandEnv,
+		loadConfig:      compose.LoadConfig,
+		fileLogger:      compose.NewFileLogger,
+		tightenPerms:    compose.TightenPermissions,
+		notify:          compose.Notify,
+		pidFile:         compose.NewPidFile,
+		buildDaemon:     compose.BuildDaemon,
 		buildSupervisor: func(env compose.PluginEnv, log *slog.Logger) supervisor {
 			return compose.BuildSupervisor(env, log)
 		},
@@ -73,6 +76,7 @@ func defaultWiring() wiring {
 		},
 		buildInspector: compose.BuildInspector,
 		sendTest:       compose.SendTest,
+		sendAgentFile:  compose.SendAgentFile,
 	}
 }
 

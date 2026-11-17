@@ -174,6 +174,23 @@ type Document struct {
 	ReplyTo  int
 }
 
+// Photo is an image uploaded inline into a forum topic.
+type Photo struct {
+	ThreadID int
+	Name     string
+	Data     []byte
+	Caption  string
+}
+
+// AgentFileUpload is a daemon-mediated request to deliver a local file for a live pane.
+type AgentFileUpload struct {
+	PaneID string `json:"pane_id"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	SHA256 string `json:"sha256"`
+}
+
 // TelegramGateway is the port to the Telegram forum group.
 type TelegramGateway interface {
 	// CreateTopic creates a topic named for the label with the status icon.
@@ -242,6 +259,13 @@ type TelegramGateway interface {
 	// SendDocument uploads one file into a topic, or into General when
 	// ThreadID is 0, as a single silent message.
 	SendDocument(ctx context.Context, doc Document) error
+	// SendPhoto uploads an image inline into a topic.
+	SendPhoto(ctx context.Context, photo Photo) error
+	// SendPhotoGuard validates the destination immediately before dispatch.
+	SendPhotoGuard(ctx context.Context, photo Photo, guard DispatchGuard) error
+	// SendOriginalDocument uploads bytes verbatim, without content redaction,
+	// while preserving the per-dispatch mapping guard.
+	SendOriginalDocument(ctx context.Context, document Document, guard DispatchGuard) error
 	// React puts one emoji reaction on the operator's message; threadID is
 	// informational, Telegram addresses reactions by message id.
 	React(ctx context.Context, threadID, messageID int, emoji string) error

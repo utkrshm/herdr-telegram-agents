@@ -3,6 +3,7 @@ package system
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,10 +22,11 @@ const (
 	// ControlPath.
 	ControlFileName = "control.sock"
 	// controlTimeout bounds one control exchange on both sides.
-	controlTimeout = 2 * time.Second
+	controlTimeout       = 2 * time.Second
+	uploadControlTimeout = 2 * time.Minute
 	// controlMaxLine caps a command line so a stray writer cannot make the
 	// daemon buffer without end.
-	controlMaxLine = 256
+	controlMaxLine = 16 * 1024
 )
 
 // Control commands understood by the daemon.
@@ -40,7 +42,11 @@ type ControlHandlers struct {
 	Stop   func()
 	Resync func()
 	Status func() string
+	Upload func(context.Context, UploadRequest) (string, error)
 }
+
+// UploadRequest asks the daemon to upload a local file for an exact live pane.
+type UploadRequest = domain.AgentFileUpload
 
 // ServeControl answers one command per connection until ctx is done, then
 // closes the listener. It never returns an error: a broken connection is
@@ -90,12 +96,34 @@ func serveControlConn(conn net.Conn, h ControlHandlers, log *slog.Logger) {
 	_ = conn.SetDeadline(time.Now().Add(controlTimeout))
 
 	line, err := bufio.NewReader(io.LimitReader(conn, controlMaxLine)).ReadString('\n')
-	cmd := strings.ToLower(strings.TrimSpace(line))
+	raw := strings.TrimSpace(line)
+	cmd := strings.ToLower(raw)
 	if err != nil && cmd == "" {
 		log.Warn("control read failed", slog.String("err", err.Error()))
 		return
 	}
-	log.Debug("control command", slog.String("cmd", cmd))
+	logCommand := cmd
+	if strings.HasPrefix(cmd, "upload ") {
+		logCommand = "upload"
+	}
+	log.Debug("control command", slog.String("cmd", logCommand))
+	if strings.HasPrefix(cmd, "upload ") {
+		_ = conn.SetDeadline(time.Now().Add(uploadControlTimeout))
+		var request UploadRequest
+		if h.Upload == nil || json.Unmarshal([]byte(strings.TrimSpace(raw[len("upload "):])), &request) != nil {
+			_, _ = io.WriteString(conn, "error: invalid upload request\n")
+			return
+		}
+		uploadCtx, cancel := context.WithTimeout(context.Background(), uploadControlTimeout-time.Second)
+		defer cancel()
+		result, uploadErr := h.Upload(uploadCtx, request)
+		if uploadErr != nil {
+			_, _ = io.WriteString(conn, "error: "+strings.ReplaceAll(uploadErr.Error(), "\n", " ")+"\n")
+			return
+		}
+		_, _ = io.WriteString(conn, "ok "+strings.ReplaceAll(result, "\n", " ")+"\n")
+		return
+	}
 
 	reply := "error: unknown command " + cmd
 	switch cmd {
@@ -122,16 +150,29 @@ func serveControlConn(conn net.Conn, h ControlHandlers, log *slog.Logger) {
 	log.Debug("control answered", slog.String("cmd", cmd), slog.String("reply", reply))
 }
 
+// SendUpload sends one typed file-upload request through the daemon socket.
+func SendUpload(ctx context.Context, stateDir string, request UploadRequest) (string, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+	return sendControl(ctx, stateDir, "upload "+string(data), uploadControlTimeout)
+}
+
 // SendControl sends one command to the daemon listening for stateDir and
 // returns its reply without the "ok " prefix. A daemon that is not
 // listening yields ErrControlUnavailable so callers can fall back.
 func SendControl(ctx context.Context, stateDir, cmd string) (string, error) {
+	return sendControl(ctx, stateDir, cmd, controlTimeout)
+}
+
+func sendControl(ctx context.Context, stateDir, cmd string, timeout time.Duration) (string, error) {
 	conn, err := dialControl(ctx, ControlPath(stateDir))
 	if err != nil {
 		return "", fmt.Errorf("control %s: %w", cmd, domain.ErrControlUnavailable)
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(controlTimeout))
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 
 	if _, err := io.WriteString(conn, cmd+"\n"); err != nil {
 		return "", fmt.Errorf("control %s: write: %w", cmd, err)

@@ -51,7 +51,7 @@ func (v *topicView) publish(m *domain.Mapping) {
 	v.mu.Lock()
 	for key, gen := range v.generations {
 		e, ok := entries[key]
-		if !ok || e.ThreadID != gen.thread || byThread[gen.thread] != key || !e.Status.Live() {
+		if !ok || e.ThreadID != gen.thread || byThread[gen.thread] != key || !e.Status.Live() || e.Closed || e.Muted {
 			gen.cancel()
 			delete(v.generations, key)
 		}
@@ -66,7 +66,7 @@ func (v *topicView) generation(key domain.Key, thread int) (*topicGeneration, er
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	e, ok := v.entries[key]
-	if !ok || e.ThreadID != thread || v.byThread[thread] != key || !e.Status.Live() {
+	if !ok || e.ThreadID != thread || v.byThread[thread] != key || !e.Status.Live() || e.Closed || e.Muted {
 		return nil, errOwnerTopicChanged
 	}
 	if gen := v.generations[key]; gen != nil {
@@ -76,6 +76,16 @@ func (v *topicView) generation(key domain.Key, thread int) (*topicGeneration, er
 	gen := &topicGeneration{thread: thread, ctx: ctx, cancel: cancel}
 	v.generations[key] = gen
 	return gen, nil
+}
+
+func (v *topicView) dispatchGuard(key domain.Key, thread int) domain.DispatchGuard {
+	return func(ctx context.Context) (context.Context, context.CancelFunc, error) {
+		gen, err := v.generation(key, thread)
+		if err != nil {
+			return nil, nil, err
+		}
+		return gen.guard(ctx)
+	}
 }
 
 func (v *topicView) invalidate(key domain.Key) {
@@ -115,4 +125,11 @@ func (v *topicView) KeyForThread(threadID int) (domain.Key, bool) {
 	defer v.mu.RUnlock()
 	k, ok := v.byThread[threadID]
 	return k, ok
+}
+
+func (v *topicView) ThreadForKey(key domain.Key) (int, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	e, ok := v.entries[key]
+	return e.ThreadID, ok && e.ThreadID > 0 && e.Status.Live() && !e.Closed && !e.Muted
 }

@@ -843,3 +843,14 @@ func sortKeys(keys []domain.Key) {
 func (r *Reconciler) KeyForThread(thread int) (domain.Key, bool) {
 	return r.topics().KeyForThread(thread)
 }
+
+// ThreadForKey returns the currently published live owner topic for key.
+func (r *Reconciler) ThreadForKey(key domain.Key) (int, bool) {
+	return r.topics().ThreadForKey(key)
+}
+
+// DispatchGuard pins the key/topic generation and is intended to run only
+// after Telegram queue pacing, immediately before the network dispatch.
+func (r *Reconciler) DispatchGuard(key domain.Key, thread int) domain.DispatchGuard {
+	return r.topics().dispatchGuard(key, thread)
+}

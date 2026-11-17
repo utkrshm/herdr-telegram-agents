@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/permgps/herdr-telegram-agents/internal/compose"
+	"github.com/permgps/herdr-telegram-agents/internal/domain"
 )
 
 // errTelegramFatal is the cancellation cause set when the Telegram poller
@@ -100,6 +101,7 @@ func runDaemon(rc *runContext, _ []string) int {
 		Stop:   requestStop,
 		Resync: start.resync,
 		Status: start.status,
+		Upload: start.upload,
 	}, log)
 	if err != nil {
 		log.Warn("control channel unavailable, signals only", slog.String("err", err.Error()))
@@ -194,9 +196,10 @@ type startupState struct {
 	version string
 	log     *slog.Logger
 
-	mu      sync.Mutex
-	attempt int
-	daemon  *compose.Daemon
+	mu            sync.Mutex
+	attempt       int
+	daemon        *compose.Daemon
+	uploadHandler func(context.Context, domain.AgentFileUpload) (string, error)
 }
 
 // retry is the Telegram startup policy with the daemon's reporting: the
@@ -234,9 +237,20 @@ func (s *startupState) attempts() int {
 func (s *startupState) ready(d *compose.Daemon) {
 	s.mu.Lock()
 	s.daemon = d
+	s.uploadHandler = d.UploadAgentFile
 	attempts := s.attempt
 	s.mu.Unlock()
 	s.log.Debug("daemon ready, control channel handed over", slog.Int("telegram_failures", attempts))
+}
+
+func (s *startupState) upload(ctx context.Context, request domain.AgentFileUpload) (string, error) {
+	s.mu.Lock()
+	upload := s.uploadHandler
+	s.mu.Unlock()
+	if upload == nil {
+		return "", errors.New("daemon is still starting")
+	}
+	return upload(ctx, request)
 }
 
 // status is the control channel's status reply: the daemon's line once it

@@ -73,6 +73,20 @@ func TestRedactingGatewayMasksEverythingThatLeaves(t *testing.T) {
 	}
 }
 
+func TestRedactingGatewayOriginalDocumentPreservesBinarySecrets(t *testing.T) {
+	fake := testkit.NewFakeTelegram(nil)
+	wrapped := NewRedactingGateway(fake, testBotToken, func() bool { return true }, nil)
+	data := append([]byte{0x00, 0xff}, []byte("password="+testBotToken+"\nkey="+testKey)...)
+	document := domain.Document{ThreadID: 0, Name: "credentials.bin", Data: data}
+	if err := wrapped.SendOriginalDocument(context.Background(), document, nil); err != nil {
+		t.Fatal(err)
+	}
+	docs := fake.Documents()
+	if len(docs) != 1 || string(docs[0].Data) != string(data) || docs[0].Name != document.Name {
+		t.Fatalf("original document changed: %+v", docs)
+	}
+}
+
 // TestRedactingGatewayMasksBotTokenWhenOff: turning privacy.redact off
 // must not leak the bot token through any method of the gateway.
 func TestRedactingGatewayMasksBotTokenWhenOff(t *testing.T) {

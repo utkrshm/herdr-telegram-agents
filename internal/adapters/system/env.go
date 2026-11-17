@@ -106,3 +106,50 @@ func InsideHerdr() bool {
 func DefaultSocketPath() (string, error) {
 	return SocketPath(os.LookupEnv, os.UserHomeDir)
 }
+
+// ReadAgentCommandEnv resolves the narrow environment needed by local agent
+// commands. Herdr panes expose HERDR_PANE_ID but do not necessarily inherit
+// plugin-specific config/state variables, so the state path falls back to
+// Herdr's XDG state layout (and an explicit variable always wins).
+func ReadAgentCommandEnv() (PluginEnv, error) {
+	return ReadAgentCommandEnvFrom(os.LookupEnv, os.UserHomeDir)
+}
+
+func ReadAgentCommandEnvFrom(lookup Lookup, home func() (string, error)) (PluginEnv, error) {
+	get := func(key string) string { value, _ := lookup(key); return value }
+	env := PluginEnv{PluginID: get("HERDR_PLUGIN_ID"), StateDir: get("HERDR_PLUGIN_STATE_DIR"),
+		ConfigDir: get("HERDR_PLUGIN_CONFIG_DIR"), BinPath: get("HERDR_BIN_PATH"),
+		Root: get("HERDR_PLUGIN_ROOT"), Path: get("PATH"), InsideHerdr: get("HERDR_ENV") == "1"}
+	if env.PluginID == "" {
+		env.PluginID = DefaultPluginID
+	}
+	if env.PluginID != DefaultPluginID {
+		return env, fmt.Errorf("agent upload commands are only available for plugin %q", DefaultPluginID)
+	}
+	if env.BinPath == "" {
+		env.BinPath = "herdr"
+	}
+	if env.StateDir == "" {
+		base := get("XDG_STATE_HOME")
+		if base == "" {
+			var err error
+			base, err = home()
+			if err != nil {
+				return env, fmt.Errorf("resolve Herdr state directory: %w", err)
+			}
+			base = filepath.Join(base, ".local", "state")
+		}
+		env.StateDir = filepath.Join(base, "herdr", "plugins", env.PluginID)
+	}
+	stateDir, err := filepath.Abs(env.StateDir)
+	if err != nil {
+		return env, fmt.Errorf("resolve Herdr plugin state path: %w", err)
+	}
+	env.StateDir = stateDir
+	socket, err := SocketPath(lookup, home)
+	if err != nil {
+		return env, err
+	}
+	env.SocketPath = socket
+	return env, nil
+}

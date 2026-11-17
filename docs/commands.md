@@ -136,6 +136,21 @@ are accepted whatever the status: sending `esc` to an idle agent does
 nothing, which is the point of not guarding it. Other agent kinds get the
 same keys and react their own way.
 
+## Local agent file uploads
+
+From an agent pane, `herdr-tg send-image <path>...` sends each image inline;
+`herdr-tg send-file <path>...` sends each file as its original document (text,
+JSON, source code, images and other file types are not converted). Both accept
+multiple paths and an optional `--pane <id>` selector. Without that selector,
+`HERDR_PANE_ID` must identify the requesting pane. The daemon refreshes Herdr's
+live pane list for every file and refuses missing or ambiguous panes and panes
+without their current open topic mapping. It uses the existing local control
+socket; bot credentials are not passed to the CLI. `send-image` sends photos up
+to 10 MB and sends larger images as documents, with a 50 MB maximum per file;
+`send-file` has the same 50 MB cap. Per-file outcomes are printed, and a failed
+upload is not blindly retried because Telegram may have accepted it despite a
+lost response. The daemon's control socket is restricted to the local user.
+
 `/close` always asks first. `Yes, close` calls `pane.close` on the agent's
 pane, never `tab.close`: a tab with one pane disappears with it, a split
 tab keeps its other panes. The question is edited to `closing <label> …`

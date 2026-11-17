@@ -58,6 +58,32 @@ func TestReadEnvFromFallbacks(t *testing.T) {
 	}
 }
 
+func TestReadAgentCommandEnvFromOrdinaryPaneEnvironment(t *testing.T) {
+	env, err := system.ReadAgentCommandEnvFrom(lookupFrom(map[string]string{
+		"HERDR_PANE_ID":     "pane-17",
+		"XDG_STATE_HOME":    "/state-home",
+		"HERDR_SOCKET_PATH": "/run/herdr.sock",
+	}), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.StateDir != filepath.Join("/state-home", "herdr", "plugins", system.DefaultPluginID) {
+		t.Fatalf("StateDir=%q", env.StateDir)
+	}
+	if env.SocketPath != "/run/herdr.sock" || env.ConfigDir != "" {
+		t.Fatalf("environment=%+v", env)
+	}
+}
+
+func TestReadAgentCommandEnvRejectsOtherPluginState(t *testing.T) {
+	_, err := system.ReadAgentCommandEnvFrom(lookupFrom(map[string]string{
+		"HERDR_PLUGIN_ID": "other.plugin",
+	}), home)
+	if err == nil || !strings.Contains(err.Error(), system.DefaultPluginID) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestReadEnvFromMissingDirs(t *testing.T) {
 	tests := []struct {
 		name string

@@ -177,6 +177,14 @@ func StartControl(ctx context.Context, env PluginEnv, h ControlHandlers, log *sl
 	}, nil
 }
 
+// SendAgentFile asks the running daemon to upload a local agent file.
+func SendAgentFile(ctx context.Context, env PluginEnv, request domain.AgentFileUpload) (string, error) {
+	return system.SendUpload(ctx, env.StateDir, request)
+}
+
+// AgentCommandEnv discovers the plugin state path for commands run from an agent pane.
+func AgentCommandEnv() (PluginEnv, error) { return system.ReadAgentCommandEnv() }
+
 // realClock is the production domain.Clock.
 type realClock struct{}
 

@@ -92,6 +92,39 @@ func TestControlCommands(t *testing.T) {
 	}
 }
 
+func TestControlUploadPreservesTypedRequest(t *testing.T) {
+	dir := testkit.ShortTempDir(t)
+	want := UploadRequest{PaneID: "pane/AbC", Path: "/tmp/My File.JSON", Name: "Data.JSON", Kind: "document"}
+	var got UploadRequest
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := ListenControl(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ServeControl(ctx, ln, ControlHandlers{Upload: func(_ context.Context, request UploadRequest) (string, error) {
+			got = request
+			return "sent", nil
+		}}, nil)
+	}()
+	reply, err := SendUpload(context.Background(), dir, want)
+	if err != nil || reply != "sent" {
+		t.Fatalf("reply=%q err=%v", reply, err)
+	}
+	if got != want {
+		t.Fatalf("request=%+v want %+v", got, want)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("control server did not stop")
+	}
+}
+
 func TestControlUnknownCommand(t *testing.T) {
 	f := startControl(t)
 	_, err := SendControl(context.Background(), f.dir, "explode")

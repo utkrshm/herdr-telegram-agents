@@ -108,6 +108,28 @@ func (r *Registry) Agent(key domain.Key) (domain.Agent, bool) {
 	return a, ok
 }
 
+// ResolvePane refreshes Herdr's authoritative live list and requires exactly
+// one agent for the requested pane. It intentionally does not guess on reuse.
+func (r *Registry) ResolvePane(ctx context.Context, paneID string) (domain.Agent, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.SnapshotTimeout)
+	defer cancel()
+	agents, err := r.herdr.ListAgents(ctx)
+	if err != nil {
+		return domain.Agent{}, fmt.Errorf("refresh Herdr pane list: %w", err)
+	}
+	var match domain.Agent
+	count := 0
+	for _, agent := range agents {
+		if agent.Key.PaneID == paneID && agent.Kind != "" {
+			match, count = agent, count+1
+		}
+	}
+	if count != 1 {
+		return domain.Agent{}, fmt.Errorf("pane %q has %d live agent matches", paneID, count)
+	}
+	return match, nil
+}
+
 // Health describes the registry's contact with the Herdr socket.
 type Health struct {
 	LastOK    time.Time // last successful snapshot

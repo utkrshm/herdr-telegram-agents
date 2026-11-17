@@ -779,6 +779,34 @@ func (g *Gateway) SendDocument(ctx context.Context, doc domain.Document) error {
 	return g.DocumentAt(ctx, domain.TopicAddress{ChatID: g.chatID, ThreadID: doc.ThreadID}, doc, nil)
 }
 
+// SendPhoto uploads an image inline as one silent message.
+func (g *Gateway) SendPhoto(ctx context.Context, photo domain.Photo) error {
+	return g.SendPhotoGuard(ctx, photo, nil)
+}
+
+func (g *Gateway) SendPhotoGuard(ctx context.Context, photo domain.Photo, guard domain.DispatchGuard) error {
+	address := domain.TopicAddress{ChatID: g.chatID, ThreadID: photo.ThreadID}
+	params := &bot.SendPhotoParams{ChatID: address.ChatID, MessageThreadID: address.ThreadID,
+		Photo:   &models.InputFileUpload{Filename: photo.Name, Data: bytes.NewReader(photo.Data)},
+		Caption: photo.Caption, DisableNotification: true}
+	err := g.destinationQueue(address.ChatID).DoOnceGuard(ctx, guard, func(ctx context.Context) error {
+		params.Photo = &models.InputFileUpload{Filename: photo.Name, Data: bytes.NewReader(photo.Data)}
+		_, err := g.api.SendPhoto(ctx, params)
+		return translate(err)
+	})
+	if err != nil {
+		g.log.Warn("sendPhoto failed", slog.Int("thread_id", address.ThreadID), slog.Int("bytes", len(photo.Data)), slog.Any("err", err))
+		return fmt.Errorf("sendPhoto thread %d: %w", address.ThreadID, err)
+	}
+	return nil
+}
+
+// SendOriginalDocument preserves the uploaded bytes exactly; it is reserved
+// for explicit local file sharing rather than text-generated documents.
+func (g *Gateway) SendOriginalDocument(ctx context.Context, document domain.Document, guard domain.DispatchGuard) error {
+	return g.DocumentAt(ctx, domain.TopicAddress{ChatID: g.chatID, ThreadID: document.ThreadID}, document, guard)
+}
+
 func (g *Gateway) SendDocumentGuard(ctx context.Context, doc domain.Document, guard domain.DispatchGuard) error {
 	return g.DocumentAt(ctx, domain.TopicAddress{ChatID: g.chatID, ThreadID: doc.ThreadID}, doc, guard)
 }
@@ -795,11 +823,7 @@ func (g *Gateway) DocumentAt(ctx context.Context, address domain.TopicAddress, d
 	if doc.ReplyTo != 0 {
 		params.ReplyParameters = &models.ReplyParameters{MessageID: doc.ReplyTo, AllowSendingWithoutReply: true}
 	}
-	do := g.destinationQueue(address.ChatID).DoGuard
-	if guard != nil {
-		do = g.destinationQueue(address.ChatID).DoOnceGuard
-	}
-	err := do(ctx, guard, func(ctx context.Context) error {
+	err := g.destinationQueue(address.ChatID).DoOnceGuard(ctx, guard, func(ctx context.Context) error {
 		params.Document = &models.InputFileUpload{Filename: doc.Name, Data: bytes.NewReader(doc.Data)}
 		_, err := g.api.SendDocument(ctx, params)
 		return translate(err)
