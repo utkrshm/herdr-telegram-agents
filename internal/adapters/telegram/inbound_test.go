@@ -83,7 +83,7 @@ func TestInboundDropsForeignAndUnauthorised(t *testing.T) {
 		reason string
 	}{
 		{"foreign chat", topicMessage(-100999, testOperator, 5, "hi"), "reason=foreign_chat"},
-		{"not operator", topicMessage(testChatID, 777, 5, "hi"), "reason=not_operator"},
+		{"not operator transfer", topicMessage(testChatID, 777, 5, "/transfer /tmp/private"), "reason=not_operator"},
 		{"no sender", topicMessage(testChatID, 0, 5, "hi"), "reason=not_operator"},
 		{"general topic", topicMessage(testChatID, testOperator, 0, "hi"), "reason=general_topic"},
 		{"edited message", &models.Update{EditedMessage: topicMessage(testChatID, testOperator, 5, "edit").Message}, ""},
@@ -93,7 +93,7 @@ func TestInboundDropsForeignAndUnauthorised(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h.bot.ProcessUpdate(ctx, tc.update)
-			if tc.name == "not operator" {
+			if tc.name == "not operator transfer" {
 				// A stranger is dropped and reported once.
 				if ev, ok := expectEvent(t, h.gw.Events()).(domain.StrangerSeen); !ok || ev.FromID != 777 || ev.ThreadID != 5 {
 					t.Fatalf("event = %#v", ev)

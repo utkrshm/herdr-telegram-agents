@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -18,6 +20,7 @@ import (
 
 // helpText is the command list shown by /help in a topic and in General.
 const helpText = `Commands
+/transfer <absolute-path> [<absolute-path> ...]: send local files here as documents (quote paths with spaces)
 /screen [N|all]: for idle or done OpenCode, Codex, Antigravity, Pi or Muse, post its complete last reply when available; otherwise the visible screen; with N the screen's last N lines, with "all" everything since your last message
 /export: export the OpenCode session's user and assistant text as a Markdown file (topic only)
 /keys k1 k2 ...: send raw keys to the agent (esc, enter, y, 1 ...)
@@ -173,7 +176,9 @@ type inbound struct {
 	// typed are prompts typed into a pane, waiting for the screen check
 	// that they left the input box, one per pane; the debouncer key is
 	// typedKey(pane).
-	typedChecks map[string]typedCheck
+	typedChecks   map[string]typedCheck
+	transferSlots chan struct{}
+	transferAsync func(func(context.Context) transferResult)
 }
 
 // followUp is a forwarded command waiting for its settle timer: which
@@ -207,16 +212,20 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 		git: svc.Git, inbox: svc.Inbox, exportTranscript: svc.ExportTranscript,
 		opts: opts, panel: newPanel(opts, tg, log),
 		cfg: cfg, store: svc.Config, log: log,
-		chrome:  opts.PostsChrome,
-		clock:   clock,
-		deb:     newDebouncer(clock, commandSettle, log),
-		pending: map[domain.Key]followUp{},
-		pickers: map[domain.Key]heldPicker{},
-		closing: map[domain.Key]int{},
-		albums:  map[string]*album{},
-		answers: map[string]entryAnswer{},
+		chrome:        opts.PostsChrome,
+		clock:         clock,
+		deb:           newDebouncer(clock, commandSettle, log),
+		pending:       map[domain.Key]followUp{},
+		pickers:       map[domain.Key]heldPicker{},
+		closing:       map[domain.Key]int{},
+		albums:        map[string]*album{},
+		answers:       map[string]entryAnswer{},
+		transferSlots: make(chan struct{}, 2),
 	}
 	in.async = func(run func(context.Context) any) {
+		_ = in.asyncDone(context.Background(), run(context.Background()))
+	}
+	in.transferAsync = func(run func(context.Context) transferResult) {
 		_ = in.asyncDone(context.Background(), run(context.Background()))
 	}
 	return in
@@ -230,6 +239,8 @@ func (i *inbound) asyncDone(ctx context.Context, job any) error {
 		return i.StartFinished(ctx, j)
 	case inboxResult:
 		return i.InboxFinished(ctx, j)
+	case transferResult:
+		return i.transferFinished(ctx, j)
 	}
 	return nil
 }
@@ -323,6 +334,8 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		return i.gitCommand(ctx, msg, key, agent, cmd.Git)
 	case domain.CmdExport:
 		return i.exportCommand(ctx, msg, key, agent)
+	case domain.CmdTransfer:
+		return i.transferFiles(ctx, msg, key, cmd.TransferPaths)
 	case domain.CmdStop:
 		i.releasePicker(key, "stop")
 		return i.control(ctx, msg, key, "stop", domain.KeyEscape, stoppedReply)
@@ -360,6 +373,116 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 	default:
 		return i.reply(ctx, msg.ThreadID, msg.MessageID, "unknown command, see /help")
 	}
+}
+
+// transferFiles starts a bounded worker; file I/O and Telegram calls never
+// hold up the bridge's serial event loop.
+func (i *inbound) transferFiles(ctx context.Context, msg domain.TopicMessage, key domain.Key, paths []string) error {
+	gen, err := i.topics.generation(key, msg.ThreadID)
+	if err != nil {
+		return i.reply(ctx, msg.ThreadID, msg.MessageID, "⚠️ topic is no longer available")
+	}
+	select {
+	case i.transferSlots <- struct{}{}:
+	default:
+		return i.reply(ctx, msg.ThreadID, msg.MessageID, "⚠️ transfer queue is busy; try again later")
+	}
+	i.transferAsync(func(workCtx context.Context) transferResult {
+		defer func() { <-i.transferSlots }()
+		return i.sendTransferFiles(workCtx, msg, gen, paths)
+	})
+	return nil
+}
+
+type transferResult struct {
+	threadID, messageID int
+	results             []string
+	generation          *topicGeneration
+}
+
+func (i *inbound) sendTransferFiles(ctx context.Context, msg domain.TopicMessage, gen *topicGeneration, paths []string) transferResult {
+	r := transferResult{threadID: msg.ThreadID, messageID: msg.MessageID, generation: gen}
+	const limit = int64(49_000_000)
+	for _, path := range paths {
+		fail := func(reason string) { r.results = append(r.results, "⚠️ "+path+": "+reason) }
+		if ctx.Err() != nil {
+			fail(transferCancelReason(ctx))
+			continue
+		}
+		if !filepath.IsAbs(path) {
+			fail("path must be absolute")
+			continue
+		}
+		file, err := openTransferFile(path)
+		if err != nil {
+			fail("file not found or unreadable")
+			continue
+		}
+		before, err := file.Stat()
+		if err != nil || !before.Mode().IsRegular() {
+			_ = file.Close()
+			fail("not a regular file")
+			continue
+		}
+		if before.Size() > limit {
+			_ = file.Close()
+			fail("exceeds 49,000,000 bytes")
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(file, limit+1))
+		after, statErr := file.Stat()
+		closeErr := file.Close()
+		if err != nil || statErr != nil || closeErr != nil {
+			fail("could not read file")
+			continue
+		}
+		if !after.Mode().IsRegular() || !os.SameFile(before, after) {
+			fail("file changed while reading")
+			continue
+		}
+		if len(data) == 0 {
+			fail("file is empty")
+			continue
+		}
+		if int64(len(data)) > limit {
+			fail("exceeds 49,000,000 bytes")
+			continue
+		}
+		original, ok := i.tg.(interface {
+			SendOriginalDocument(context.Context, domain.Document, domain.DispatchGuard) error
+		})
+		if !ok {
+			fail("original-file upload is unavailable")
+			continue
+		}
+		doc := domain.Document{ThreadID: msg.ThreadID, ReplyTo: msg.MessageID, Name: filepath.Base(path), Data: data}
+		if err := original.SendOriginalDocument(ctx, doc, gen.guard); err != nil {
+			if ctx.Err() != nil {
+				fail("send outcome unknown; not retried (" + transferCancelReason(ctx) + ")")
+			} else {
+				fail("Telegram send failed (not retried)")
+			}
+			continue
+		}
+		r.results = append(r.results, "✅ sent "+filepath.Base(path))
+	}
+	return r
+}
+
+func transferCancelReason(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "transfer timed out"
+	}
+	return "transfer cancelled during shutdown"
+}
+
+func (i *inbound) transferFinished(ctx context.Context, r transferResult) error {
+	call, release, err := r.generation.guard(ctx)
+	if err != nil {
+		return nil
+	}
+	defer release()
+	return i.reply(call, r.threadID, r.messageID, strings.Join(r.results, "\n"))
 }
 
 // control sends one control key (esc or ctrl+c) to a live agent in any
@@ -713,7 +836,7 @@ func (i *inbound) HandleGeneral(ctx context.Context, cmd domain.GeneralCommand) 
 		return i.reply(ctx, 0, cmd.MessageID, topicOnly)
 	case domain.CmdNew:
 		return i.startAgent(ctx, cmd, parsed)
-	case domain.CmdGit, domain.CmdExport:
+	case domain.CmdGit, domain.CmdExport, domain.CmdTransfer:
 		return i.reply(ctx, 0, cmd.MessageID, topicOnly)
 	case domain.CmdObservers:
 		return i.observers(ctx, cmd, parsed.Observers)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -233,7 +235,7 @@ func TestInboundStatusHelpUnknown(t *testing.T) {
 	if sent[0].Text != "❓ blocked · ws · reviewer · pane p1" || sent[0].ReplyTo != 3 || sent[0].Notify {
 		t.Errorf("status reply = %+v", sent[0])
 	}
-	if !strings.HasPrefix(sent[1].Text, "Commands\n/screen") || !strings.Contains(sent[1].Text, "/clear, /compact [instructions], /usage, /model [name]") || !strings.Contains(sent[1].Text, "buttons") {
+	if !strings.HasPrefix(sent[1].Text, "Commands\n/transfer") || !strings.Contains(sent[1].Text, "/clear, /compact [instructions], /usage, /model [name]") || !strings.Contains(sent[1].Text, "buttons") {
 		t.Errorf("help reply = %q", sent[1].Text)
 	}
 	if sent[2].Text != "unknown command, see /help" {
@@ -241,6 +243,206 @@ func TestInboundStatusHelpUnknown(t *testing.T) {
 	}
 	if n := len(f.herdr.Prompts()) + len(f.herdr.Keys()); n != 0 {
 		t.Errorf("commands reached herdr: %d calls", n)
+	}
+}
+
+func TestTransferCommandSendsExactBytesAndReportsEachFile(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	dir := t.TempDir()
+	good := filepath.Join(dir, "raw data.bin")
+	if err := os.WriteFile(good, []byte{0, 0xff, '\n'}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nonregular := filepath.Join(dir, "directory")
+	if err := os.Mkdir(nonregular, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Quote the path with spaces to keep it one argument.
+	line := "/transfer relative \"" + good + "\" " + empty + " " + filepath.Join(dir, "missing") + " " + nonregular
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 44, line)); err != nil {
+		t.Fatal(err)
+	}
+	docs := f.tg.Documents()
+	if len(docs) != 1 || docs[0].ThreadID != 101 || docs[0].ReplyTo != 44 || docs[0].Name != filepath.Base(good) || string(docs[0].Data) != string([]byte{0, 0xff, '\n'}) {
+		t.Fatalf("documents = %+v", docs)
+	}
+	if len(f.herdr.Prompts()) != 0 {
+		t.Fatalf("transfer involved agent: %+v", f.herdr.Prompts())
+	}
+	sent := f.tg.Sent()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "path must be absolute") || !strings.Contains(sent[0].Text, "file is empty") || !strings.Contains(sent[0].Text, "file not found") || !strings.Contains(sent[0].Text, "not a regular file") || !strings.Contains(sent[0].Text, "✅ sent raw data.bin") {
+		t.Fatalf("per-file result = %+v", sent)
+	}
+}
+
+func TestParseTransferPaths(t *testing.T) {
+	paths, err := domain.ParseTransferPaths(`/tmp/a "/tmp/a b" '/tmp/c d'`)
+	if err != nil || !reflect.DeepEqual(paths, []string{"/tmp/a", "/tmp/a b", "/tmp/c d"}) {
+		t.Fatalf("paths=%q err=%v", paths, err)
+	}
+	if _, err := domain.ParseTransferPaths(`"/tmp/no-end`); err == nil {
+		t.Fatal("unterminated quote accepted")
+	}
+}
+
+func TestTransferFileSizeBoundary(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	path := filepath.Join(t.TempDir(), "boundary.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(49_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	msg := topicMsg(101, 45, "/transfer "+path)
+	gen, err := f.in.topics.generation(a.Key, msg.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := f.in.sendTransferFiles(f.ctx, msg, gen, []string{path})
+	if len(r.results) != 1 || !strings.HasPrefix(r.results[0], "✅ sent") {
+		t.Fatalf("exact limit result = %v", r.results)
+	}
+	if docs := f.tg.Documents(); len(docs) != 1 || len(docs[0].Data) != 49_000_000 {
+		t.Fatalf("exact limit document count/size = %d/%d", len(docs), len(docs[0].Data))
+	}
+	if err := os.Truncate(path, 49_000_001); err != nil {
+		t.Fatal(err)
+	}
+	r = f.in.sendTransferFiles(f.ctx, msg, gen, []string{path})
+	if len(r.results) != 1 || !strings.Contains(r.results[0], "exceeds 49,000,000 bytes") || len(f.tg.Documents()) != 1 {
+		t.Fatalf("over limit result=%v docs=%d", r.results, len(f.tg.Documents()))
+	}
+}
+
+func TestTransferFailureIsAttemptedOnceAndCancelsTypingWait(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	path := filepath.Join(t.TempDir(), "once.bin")
+	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.out.typing[a.Key] = typingWait{threadID: 101, messageID: 9}
+	f.tg.FailNext("document", domain.ErrForbidden)
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 46, "/transfer "+path)); err != nil {
+		t.Fatal(err)
+	}
+	if _, waiting := f.out.typing[a.Key]; waiting {
+		t.Fatal("transfer left free-text wait active")
+	}
+	attempts := 0
+	for _, call := range f.tg.Calls() {
+		if strings.HasPrefix(call, "document:") {
+			attempts++
+		}
+	}
+	if attempts != 1 || len(f.tg.Documents()) != 0 {
+		t.Fatalf("attempts=%v docs=%d", f.tg.Calls(), len(f.tg.Documents()))
+	}
+	if sent := f.tg.Sent(); len(sent) == 0 || !strings.Contains(sent[len(sent)-1].Text, "not retried") {
+		t.Fatalf("failure was not reported: %+v", sent)
+	}
+}
+
+func TestTransferGenerationIsNotReacquiredAfterRestore(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	old, err := f.view.generation(a.Key, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.view.invalidate(a.Key)
+	f.view.publish(f.mapping)
+	newGeneration, err := f.view.generation(a.Key, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old == newGeneration {
+		t.Fatal("restored mapping reused invalid generation")
+	}
+	if _, _, err := old.guard(f.ctx); err == nil {
+		t.Fatal("queued guard was reassigned to the restored mapping")
+	}
+	if err := f.in.transferFinished(f.ctx, transferResult{threadID: 101, messageID: 9, generation: old, results: []string{"✅ sent earlier"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.tg.Sent()) != 0 {
+		t.Fatalf("stale completion reached restored topic: %+v", f.tg.Sent())
+	}
+	if _, release, err := newGeneration.guard(f.ctx); err != nil {
+		t.Fatalf("new generation guard: %v", err)
+	} else {
+		release()
+	}
+}
+
+type blockingTransferTelegram struct {
+	domain.TelegramGateway
+	started chan struct{}
+	release chan struct{}
+	blockOn int
+	calls   int
+}
+
+func (tg *blockingTransferTelegram) SendOriginalDocument(ctx context.Context, doc domain.Document, guard domain.DispatchGuard) error {
+	tg.calls++
+	if tg.calls == tg.blockOn {
+		select {
+		case tg.started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-tg.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return tg.TelegramGateway.SendOriginalDocument(ctx, doc, guard)
+}
+
+func TestBlockedTransferWorkerDoesNotBlockBridgeHandler(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	path := filepath.Join(t.TempDir(), "slow.bin")
+	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingTransferTelegram{TelegramGateway: f.tg, started: make(chan struct{}, 1), release: make(chan struct{}), blockOn: 1}
+	f.in.tg = blocked
+	f.in.transferAsync = func(run func(context.Context) transferResult) {
+		go func() { _ = f.in.transferFinished(f.ctx, run(f.ctx)) }()
+	}
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 50, "/transfer "+path)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("upload worker did not start")
+	}
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 51, "still responsive")); err != nil {
+		t.Fatal(err)
+	}
+	if prompts := f.herdr.Prompts(); len(prompts) != 1 || prompts[0] != "p1: still responsive" {
+		t.Fatalf("prompt while upload blocked = %v", prompts)
+	}
+	close(blocked.release)
+	deadline := time.Now().Add(time.Second)
+	for len(f.tg.Documents()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(f.tg.Documents()) != 1 {
+		t.Fatal("transfer did not complete")
 	}
 }
 

@@ -163,6 +163,9 @@ const (
 	// asyncTimeout bounds one background job of the bridge: an agent start
 	// (its own timeout plus grace) or a file download.
 	asyncTimeout = agentStartTimeout + agentStartGrace
+	// transferWorkerTimeout bounds each whole /transfer request. Its result is
+	// submitted with the bridge lifetime context, not this worker deadline.
+	transferWorkerTimeout = 2 * time.Minute
 	// albumSettle is how long an album waits for more parts after the last
 	// one before it becomes one prompt.
 	albumSettle = 1 * time.Second

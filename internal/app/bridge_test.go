@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -105,6 +106,61 @@ func TestBridgeRunsJobsInOrder(t *testing.T) {
 	}
 	if firstScreen < 0 || secondAck < firstScreen {
 		t.Fatalf("same-topic notices reordered: %q", calls)
+	}
+}
+
+func TestTransferWorkerTimeoutReportsPartialResults(t *testing.T) {
+	r := newRunningBridge(t, func(_ *bridgeFixture, b *Bridge) { b.transferTimeout = 75 * time.Millisecond })
+	r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	dir := t.TempDir()
+	first, second := dir+"/first.bin", dir+"/second.bin"
+	if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingTransferTelegram{TelegramGateway: r.bridge.in.tg, started: make(chan struct{}, 1), release: make(chan struct{}), blockOn: 2}
+	r.bridge.in.tg = blocked
+	r.bridge.Submit(topicMsg(101, 501, "/transfer "+first+" "+second+" "+dir+"/never.bin"))
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("second upload did not start")
+	}
+	waitUntil(t, "partial transfer result after worker timeout", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 501 && strings.Contains(sent.Text, "✅ sent first.bin") && strings.Contains(sent.Text, "outcome unknown") && strings.Contains(sent.Text, "timed out") {
+				return true
+			}
+		}
+		return false
+	})
+	if len(r.tg.Documents()) != 1 || r.tg.Documents()[0].ThreadID != 101 {
+		t.Fatalf("successful upload routing = %+v", r.tg.Documents())
+	}
+}
+
+func TestTransferWorkerStopsOnBridgeShutdown(t *testing.T) {
+	r := newRunningBridge(t)
+	r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	path := t.TempDir() + "/blocked.bin"
+	if err := os.WriteFile(path, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingTransferTelegram{TelegramGateway: r.bridge.in.tg, started: make(chan struct{}, 1), release: make(chan struct{}), blockOn: 1}
+	r.bridge.in.tg = blocked
+	r.bridge.Submit(topicMsg(101, 502, "/transfer "+path))
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("upload did not start")
+	}
+	r.cancel()
+	select {
+	case <-r.done:
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not stop after cancelling upload")
 	}
 }
 

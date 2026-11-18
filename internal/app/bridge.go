@@ -49,8 +49,9 @@ type Bridge struct {
 	wg     sync.WaitGroup
 
 	// CallTimeout bounds one job; tests shorten it.
-	CallTimeout   time.Duration
-	pendingUpdate *domain.UpdateJob
+	CallTimeout     time.Duration
+	transferTimeout time.Duration
+	pendingUpdate   *domain.UpdateJob
 }
 
 // RestoreUpdate schedules a persisted progress view for the first bridge
@@ -109,6 +110,7 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 		fatal:           make(chan error, 1),
 		log:             log,
 		CallTimeout:     bridgeCallTimeout,
+		transferTimeout: transferWorkerTimeout,
 	}
 	in.panel.chatID, in.panel.operators = cfg.ChatID, append([]int64(nil), cfg.OperatorIDs...)
 	in.panel.updates, in.panel.jobs = svc.Updates, svc.UpdateJobs
@@ -129,6 +131,9 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 				b.log.Warn("[FIX] bridge async result not accepted", slog.String("err", err.Error()))
 			}
 		})
+	}
+	in.transferAsync = func(run func(context.Context) transferResult) {
+		b.spawnTransfer(run)
 	}
 	in.promptNotice = func(_ context.Context, key domain.Key, threadID, messageID int, confirmed bool) error {
 		gen, err := in.topics.generation(key, threadID)
@@ -210,6 +215,33 @@ func (b *Bridge) spawn(fn func(context.Context)) {
 	}()
 }
 
+// spawnTransfer bounds the upload worker independently but reports its
+// partial result using the bridge lifetime context, so worker timeout does
+// not discard the outcome. Shutdown still cancels both work and delivery.
+func (b *Bridge) spawnTransfer(run func(context.Context) transferResult) {
+	parent := b.runCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		timeout := b.transferTimeout
+		if timeout <= 0 {
+			timeout = transferWorkerTimeout
+		}
+		worker, cancel := context.WithTimeout(parent, timeout)
+		defer cancel()
+		result := run(worker)
+		if parent.Err() != nil {
+			return
+		}
+		if err := b.SubmitContext(parent, result); err != nil && parent.Err() == nil {
+			b.log.Warn("transfer result not accepted", slog.String("err", err.Error()))
+		}
+	}()
+}
+
 // presenceAway is the job the daemon submits when quiet mode ends: the
 // outbound posts the questions that are still waiting.
 type presenceAway struct{}
@@ -280,7 +312,7 @@ func (b *Bridge) SubmitContext(ctx context.Context, job any) error {
 	switch job.(type) {
 	case AgentEvent:
 		queue = b.jobs
-	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, updateCheckResult, updateStartResult:
+	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, updateCheckResult, updateStartResult:
 		queue = b.control
 	default:
 		b.log.Warn("bridge job of unknown type dropped", slog.String("type", fmt.Sprintf("%T", job)))
@@ -485,6 +517,8 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 	case inboxResult:
 		b.log.Debug("bridge job", slog.String("kind", "inbox_result"), slog.Int("message_id", j.messageID), slog.Int("saved", len(j.paths)), slog.Int("failed", len(j.failed)))
 		b.run(ctx, "inbox_result", func(ctx context.Context) error { return b.in.InboxFinished(ctx, j) })
+	case transferResult:
+		b.run(ctx, "transfer_result", func(ctx context.Context) error { return b.in.transferFinished(ctx, j) })
 	case domain.GeneralCommand:
 		if b.sharingCommand(ctx, j.FromID, j.ChatID, 0, j.MessageID, j.Text) {
 			return

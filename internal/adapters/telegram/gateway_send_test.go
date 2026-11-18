@@ -484,6 +484,23 @@ func TestSendDocument(t *testing.T) {
 	}
 }
 
+func TestSendOriginalDocumentRoutesToRequestedTopicVerbatim(t *testing.T) {
+	h := newHarness(t)
+	h.api.on("sendDocument", func(url.Values) apiReply { return okReply(map[string]any{"message_id": 8}) })
+	body := []byte{0, 0xff, '\n'}
+	if err := h.gw.SendOriginalDocument(h.ctx, domain.Document{ThreadID: 77, ReplyTo: 12, Name: "raw.bin", Data: body}, nil); err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendDocument")
+	if len(calls) != 1 || calls[0].form.Get("message_thread_id") != "77" {
+		t.Fatalf("sendDocument calls/routing = %+v", calls)
+	}
+	file := calls[0].files["document"]
+	if file.name != "raw.bin" || string(file.data) != string(body) {
+		t.Fatalf("uploaded document = %+v", file)
+	}
+}
+
 func TestSendDocumentToGeneralAndErrors(t *testing.T) {
 	h := newHarness(t)
 	h.api.on("sendDocument", func(form url.Values) apiReply {

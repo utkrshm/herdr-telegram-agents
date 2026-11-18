@@ -18,8 +18,9 @@ const (
 	// CmdScreen posts the agent's screen; Lines 0 means the whole visible
 	// screen, otherwise the last Lines lines; All means the output since
 	// the last human message.
-	CmdScreen CommandKind = "screen"
-	CmdExport CommandKind = "export"
+	CmdScreen   CommandKind = "screen"
+	CmdExport   CommandKind = "export"
+	CmdTransfer CommandKind = "transfer"
 	// CmdFocus brings the agent's pane to the front in Herdr.
 	CmdFocus CommandKind = "focus"
 	// CmdStatus answers with the agent status (topic) or a summary of every
@@ -295,6 +296,8 @@ type Command struct {
 	// Git is the resolved argv for CmdGit; an empty Sub means the operator
 	// asked for something outside the allow-list and gets GitUsage.
 	Git GitSpec
+	// TransferPaths are the shell-quoted local paths supplied to /transfer.
+	TransferPaths []string
 	// Observers is the action of CmdObservers.
 	Observers ObserversSpec
 }
@@ -453,6 +456,12 @@ func ParseCommand(text, botUsername string) Command {
 		return parseScreen(args)
 	case "export":
 		return bareCommand(CmdExport, word, args)
+	case "transfer":
+		paths, err := ParseTransferPaths(rest)
+		if err != nil || len(paths) == 0 {
+			return Command{Kind: CmdUnknown, Text: text}
+		}
+		return Command{Kind: CmdTransfer, TransferPaths: paths, Text: text}
 	case "keys":
 		if len(args) == 0 {
 			return Command{Kind: CmdUnknown, Text: "/keys"}
@@ -492,6 +501,55 @@ func ParseCommand(text, botUsername string) Command {
 		return Command{Kind: CmdForward, Text: line, Forward: rule}
 	}
 	return Command{Kind: CmdUnknown, Text: "/" + word}
+}
+
+// ParseTransferPaths parses shell-style quoted paths without invoking a shell.
+func ParseTransferPaths(input string) ([]string, error) {
+	var paths []string
+	var token strings.Builder
+	var quote rune
+	escaped, active := false, false
+	for _, r := range input {
+		if escaped {
+			token.WriteRune(r)
+			escaped, active = false, true
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped, active = true, true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				token.WriteRune(r)
+			}
+			active = true
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote, active = r, true
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\n' {
+			if active {
+				paths = append(paths, token.String())
+				token.Reset()
+				active = false
+			}
+			continue
+		}
+		token.WriteRune(r)
+		active = true
+	}
+	if escaped || quote != 0 {
+		return nil, strconv.ErrSyntax
+	}
+	if active {
+		paths = append(paths, token.String())
+	}
+	return paths, nil
 }
 
 // bareCommand is the shape of a command that takes no argument: with
