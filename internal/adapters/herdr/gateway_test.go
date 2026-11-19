@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -328,6 +329,25 @@ func TestGatewayReadScreenOmitsZeroLines(t *testing.T) {
 	}
 	if got := lastParams(t, s, "agent.read"); got["lines"] != nil {
 		t.Fatalf("lines should be omitted, params = %v", got)
+	}
+}
+
+func TestGatewayReadScreenANSIIsExplicitAndKeepsPlainText(t *testing.T) {
+	s := testkit.NewNDJSONServer(t, nil)
+	const styled = "\x1b[48;2;30;30;30m┃ Shell\x1b[0m"
+	s.Handle("agent.read", func(id string, params json.RawMessage) (any, *testkit.APIError) {
+		return map[string]any{"type": "pane_read", "read": map[string]any{"text": styled}}, nil
+	})
+	g := newGateway(t, s)
+	screen, err := g.ReadScreenANSI(ctxT(t), "w3:p2", domain.ScreenVisible, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if screen.ANSI != styled || strings.Contains(screen.Text, "\x1b") || screen.Text != "┃ Shell" {
+		t.Fatalf("screen did not preserve ANSI separately: %+v", screen)
+	}
+	if got := lastParams(t, s, "agent.read"); got["format"] != "ansi" || got["strip_ansi"] != false {
+		t.Fatalf("ANSI read params = %v", got)
 	}
 }
 

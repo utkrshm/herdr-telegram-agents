@@ -19,7 +19,10 @@ const (
 
 // Screen is a snapshot of an agent's terminal text.
 type Screen struct {
-	Text      string
+	Text string
+	// ANSI is populated only by the explicit shell-mode screen reader. It is
+	// never included in user-facing output; shell readiness uses its styling.
+	ANSI      string
 	Revision  int64
 	Truncated bool
 }

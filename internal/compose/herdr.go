@@ -29,6 +29,8 @@ type HerdrGateway interface {
 	// PaneProcesses returns the pids in the foreground of a pane, for a
 	// reply source that ties a pane to an agent session by process.
 	PaneProcesses(ctx context.Context, paneID string) ([]int, error)
+	// ReadScreenANSI retains TUI styles for conservative shell composer checks.
+	ReadScreenANSI(ctx context.Context, target string, source domain.ScreenSource, lines int) (domain.Screen, error)
 }
 
 // NewHerdrGateway builds the Herdr adapter for the socket at path with the

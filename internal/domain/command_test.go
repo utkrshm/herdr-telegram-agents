@@ -9,7 +9,40 @@ import (
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
 )
 
+func TestParseShellCommandRequiresOneQuotedCommand(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+		valid bool
+	}{
+		{`/shell "printf 'a b'"`, `printf 'a b'`, true},
+		{`/shell 'printf "a b"'`, `printf "a b"`, true},
+		{`/shell printf hi`, "", false},
+		{`/shell ""`, "", false},
+		{`/shell "echo hi" extra`, "", false},
+		{`/shell "echo "bad""`, "", false},
+	} {
+		got := domain.ParseCommand(test.input, "")
+		if test.valid {
+			if got.Kind != domain.CmdShell || got.Shell != test.want {
+				t.Errorf("ParseCommand(%q) = %+v, want shell %q", test.input, got, test.want)
+			}
+		} else if got.Kind != domain.CmdUnknown {
+			t.Errorf("ParseCommand(%q) = %+v, want unknown", test.input, got)
+		}
+	}
+}
+
 func TestParseCommand(t *testing.T) {
+	if got := domain.ParseCommand("/shell-status", "bot"); got.Kind != domain.CmdShellStatus {
+		t.Fatalf("shell status parse = %#v", got)
+	}
+	if got := domain.ParseCommand("/shell-status extra", "bot"); got.Kind != domain.CmdUnknown {
+		t.Fatalf("shell status with args = %#v", got)
+	}
+	if got := domain.ParseCommand("/shell-status@other", "bot"); got.Kind != domain.CmdUnknown {
+		t.Fatalf("foreign bot command = %#v", got)
+	}
 	tests := []struct {
 		name string
 		in   string

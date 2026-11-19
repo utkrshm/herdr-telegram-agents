@@ -53,6 +53,10 @@ const (
 	// CmdGit runs a read-only git command in the agent's working directory
 	// (/git status | diff [staged] | log [N]).
 	CmdGit CommandKind = "git"
+	// CmdShell runs the quoted command in an OpenCode agent.
+	CmdShell CommandKind = "shell"
+	// CmdShellStatus requests a read-only snapshot of the visible screen.
+	CmdShellStatus CommandKind = "shell_status"
 	// CmdObservers lists or changes the observers (General only); Observers
 	// holds the action and the id.
 	CmdObservers CommandKind = "observers"
@@ -296,6 +300,8 @@ type Command struct {
 	// Git is the resolved argv for CmdGit; an empty Sub means the operator
 	// asked for something outside the allow-list and gets GitUsage.
 	Git GitSpec
+	// Shell is the shell command passed to /shell.
+	Shell string
 	// TransferPaths are the shell-quoted local paths supplied to /transfer.
 	TransferPaths []string
 	// Observers is the action of CmdObservers.
@@ -404,6 +410,35 @@ func ParseGit(args []string) (GitSpec, bool) {
 	return GitSpec{}, false
 }
 
+// parseShellCommand requires the entire command to be enclosed in matching
+// quotes. It removes only the outer pair so shell syntax inside stays intact.
+func parseShellCommand(input string) (string, bool) {
+	input = strings.TrimSpace(input)
+	if len(input) < 3 || (input[0] != '\'' && input[0] != '"') || input[len(input)-1] != input[0] {
+		return "", false
+	}
+	quote := input[0]
+	escaped := false
+	for i := 1; i < len(input)-1; i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if input[i] == '\\' && quote == '"' {
+			escaped = true
+			continue
+		}
+		if input[i] == quote {
+			return "", false
+		}
+	}
+	if escaped {
+		return "", false
+	}
+	command := input[1 : len(input)-1]
+	return command, strings.TrimSpace(command) != ""
+}
+
 // Bounds of the /away duration argument.
 const (
 	MinAway = time.Minute
@@ -490,6 +525,14 @@ func ParseCommand(text, botUsername string) Command {
 	case "git":
 		spec, _ := ParseGit(args)
 		return Command{Kind: CmdGit, Git: spec}
+	case "shell":
+		command, ok := parseShellCommand(rest)
+		if !ok {
+			return Command{Kind: CmdUnknown, Text: text}
+		}
+		return Command{Kind: CmdShell, Shell: command}
+	case "shell-status":
+		return bareCommand(CmdShellStatus, word, args)
 	case "observers":
 		return parseObservers(args)
 	}

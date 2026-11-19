@@ -136,6 +136,7 @@ type paneReadResult struct {
 		Source      string `json:"source"`
 		Format      string `json:"format"`
 		Text        string `json:"text"`
+		ANSI        string `json:"ansi"`
 		Revision    int64  `json:"revision"`
 		Truncated   bool   `json:"truncated"`
 	} `json:"read"`

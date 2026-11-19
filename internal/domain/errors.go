@@ -96,6 +96,9 @@ var (
 	// ErrFileTooBig means an attachment is larger than the inbox allows or
 	// than Telegram lets a bot download.
 	ErrFileTooBig = errors.New("file is too big")
+	// ErrShellOutputTooLarge means a shell result exceeds the bounded SQLite
+	// read cap; no partial output is presented as complete.
+	ErrShellOutputTooLarge = errors.New("OpenCode shell output exceeds the safe read limit")
 	// ErrNotRepository means the agent's working directory is not inside a
 	// git repository.
 	ErrNotRepository = errors.New("not a git repository")

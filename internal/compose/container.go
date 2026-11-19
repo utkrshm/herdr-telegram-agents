@@ -486,10 +486,13 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 	system.SweepOpenCodeExports(env.StateDir, log)
 	exporter := system.NewOpenCodeExporter(env.StateDir, log)
 	openCodeExport := exporter.Export
+	shell := system.NewOpenCodeShell(hg.AgentSession, func(ctx context.Context, pane string) (domain.Screen, error) {
+		return hg.ReadScreenANSI(ctx, pane, domain.ScreenVisible, 120)
+	}, hg.SendKeys, hg.SendText)
 	// The Muse reader ties a pane's pids to their process start times.
 	started := system.NewProcess(env.StateDir, log).StartTime
 	bridge := app.NewBridge(cfg, hg, tg, registry, reconciler, capture, opts,
-		app.Services{Replies: replySources(hg.AgentSessions, hg.AgentSession, openCodeExport, hg.PaneProcesses, started, log), ExportTranscript: transcript.NewOpenCodeReader(hg.AgentSession, exporter.ExportFull, log).Transcript, Git: system.NewGitRunner(log), Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log),
+		app.Services{Replies: replySources(hg.AgentSessions, hg.AgentSession, openCodeExport, hg.PaneProcesses, started, log), ExportTranscript: transcript.NewOpenCodeReader(hg.AgentSession, exporter.ExportFull, log).Transcript, Git: system.NewGitRunner(log), Shell: shell.Run, Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log),
 			Updates: BuildUpdateManager(env, log), UpdateJobs: state.NewUpdateStore(env.StateDir, log),
 			LaunchUpdate:  func(ctx context.Context, id string) (int, error) { return LaunchUpdateWorker(ctx, env, id, log) },
 			UpdateRunning: func() bool { return BuildSupervisor(env, log).Status().Running }}, clock, log)

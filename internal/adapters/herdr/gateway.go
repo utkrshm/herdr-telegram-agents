@@ -230,22 +230,58 @@ func (g *Gateway) PaneProcesses(ctx context.Context, paneID string) ([]int, erro
 
 // ReadScreen returns plain text from the agent's terminal.
 func (g *Gateway) ReadScreen(ctx context.Context, target string, source domain.ScreenSource, lines int) (domain.Screen, error) {
+	return g.readScreen(ctx, target, source, lines, "text", true)
+}
+
+// ReadScreenANSI is reserved for the OpenCode shell safety check. Keeping it
+// separate ensures ordinary screen reads remain stripped and redaction-safe.
+func (g *Gateway) ReadScreenANSI(ctx context.Context, target string, source domain.ScreenSource, lines int) (domain.Screen, error) {
+	return g.readScreen(ctx, target, source, lines, "ansi", false)
+}
+
+func (g *Gateway) readScreen(ctx context.Context, target string, source domain.ScreenSource, lines int, format string, stripANSI bool) (domain.Screen, error) {
 	var res paneReadResult
 	params := readParams{
 		Target:    target,
 		Source:    string(source),
 		Lines:     lines,
-		Format:    "text",
-		StripANSI: true,
+		Format:    format,
+		StripANSI: stripANSI,
 	}
 	if err := g.call(ctx, "agent.read", target, params, &res); err != nil {
 		return domain.Screen{}, err
 	}
+	ansi := res.Read.ANSI
+	text := res.Read.Text
+	if format == "ansi" {
+		ansi = text
+		text = stripANSIText(text)
+	}
 	return domain.Screen{
-		Text:      res.Read.Text,
+		Text:      text,
+		ANSI:      ansi,
 		Revision:  res.Read.Revision,
 		Truncated: res.Read.Truncated,
 	}, nil
+}
+
+func stripANSIText(value string) string {
+	var out strings.Builder
+	for index := 0; index < len(value); {
+		if value[index] == '\x1b' && index+1 < len(value) && value[index+1] == '[' {
+			index += 2
+			for index < len(value) && (value[index] < 0x40 || value[index] > 0x7e) {
+				index++
+			}
+			if index < len(value) {
+				index++
+			}
+			continue
+		}
+		out.WriteByte(value[index])
+		index++
+	}
+	return out.String()
 }
 
 // Prompt types text into the agent and submits it without waiting for the

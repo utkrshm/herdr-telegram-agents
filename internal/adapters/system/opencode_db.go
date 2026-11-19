@@ -25,12 +25,16 @@ const (
 	// openCodeDBMaxResult caps the rebuilt document handed to the reader.
 	openCodeDBMaxResult = 4 << 20
 	// openCodeSQLiteBin is the CLI used to read opencode's store.
-	openCodeSQLiteBin = "sqlite3"
+	openCodeSQLiteBin        = "sqlite3"
+	openCodePythonBin        = "python3"
+	openCodeWindowsPythonBin = "python"
 )
 
 // openCodeSessionIDPattern matches the session ids opencode uses; anything
 // else never reaches the query string.
 var openCodeSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`)
+
+var errOpenCodeDBOutputLimit = errors.New("OpenCode database output limit exceeded")
 
 // openCodeDBQuery returns the session's rows from the last user message on.
 // The reader only needs the newest turn, and the whole-session export can be
@@ -108,7 +112,7 @@ func defaultOpenCodeDBPath() (string, error) {
 func runOpenCodeSQLite(ctx context.Context, dbPath, query string) ([]byte, error) {
 	bin, err := exec.LookPath(openCodeSQLiteBin)
 	if err != nil {
-		return nil, errors.New("sqlite3 not on PATH")
+		return runOpenCodePythonSQLite(ctx, dbPath, query)
 	}
 	// The database is opened through a file: URI in read-only mode and with
 	// an empty init file, so neither a relative path nor ~/.sqliterc can
@@ -119,11 +123,52 @@ func runOpenCodeSQLite(ctx context.Context, dbPath, query string) ([]byte, error
 	cmd.Stderr = io.Discard
 	stdout := &limitedWriter{max: openCodeDBMaxOutput}
 	cmd.Stdout = stdout
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("sqlite3: %w", err)
-	}
+	runErr := cmd.Run()
 	if stdout.capped {
-		return nil, fmt.Errorf("sqlite3: output over %d bytes", openCodeDBMaxOutput)
+		return nil, fmt.Errorf("%w: %d bytes", errOpenCodeDBOutputLimit, openCodeDBMaxOutput)
+	}
+	if runErr != nil {
+		return nil, fmt.Errorf("sqlite3: %w", runErr)
+	}
+	return stdout.buf.Bytes(), nil
+}
+
+// runOpenCodePythonSQLite is the standard-library fallback when sqlite3 is
+// not installed. Python's URI mode is read-only; SQL and database paths are
+// passed as argv rather than interpolated into the script.
+func runOpenCodePythonSQLite(ctx context.Context, dbPath, query string) ([]byte, error) {
+	python, err := exec.LookPath(openCodePythonBin)
+	if err != nil {
+		python, err = exec.LookPath(openCodeWindowsPythonBin)
+		if err != nil {
+			return nil, errors.New("neither sqlite3 nor Python is available")
+		}
+	}
+	const script = `import json, sqlite3, sys, urllib.parse
+db = sqlite3.connect("file:" + urllib.parse.quote(sys.argv[1], safe="/") + "?mode=ro", uri=True, timeout=4)
+db.row_factory = sqlite3.Row
+try:
+ cursor = db.execute(sys.argv[2])
+ sys.stdout.write("[")
+ first = True
+ for row in cursor:
+  if not first: sys.stdout.write(",")
+  first = False
+  sys.stdout.write(json.dumps(dict(row), ensure_ascii=False, separators=(",", ":")))
+ sys.stdout.write("]\n")
+finally:
+ db.close()`
+	cmd := command(ctx, python, "-c", script, filepath.ToSlash(dbPath), query)
+	cmd.WaitDelay = openCodeWaitDelay
+	cmd.Stderr = io.Discard
+	stdout := &limitedWriter{max: openCodeDBMaxOutput}
+	cmd.Stdout = stdout
+	runErr := cmd.Run()
+	if stdout.capped {
+		return nil, fmt.Errorf("%w: %d bytes", errOpenCodeDBOutputLimit, openCodeDBMaxOutput)
+	}
+	if runErr != nil {
+		return nil, fmt.Errorf("python sqlite: %w", runErr)
 	}
 	return stdout.buf.Bytes(), nil
 }

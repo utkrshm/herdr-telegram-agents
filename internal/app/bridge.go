@@ -69,7 +69,10 @@ type Services struct {
 	Replies          domain.ReplySource
 	ExportTranscript func(context.Context, domain.Agent) ([]byte, error)
 	Git              domain.GitRunner
-	Inbox            domain.InboxStore
+	// Shell runs one already-validated OpenCode shell request through its
+	// transcript store. It returns only after an exact result is recorded.
+	Shell func(context.Context, domain.Agent, string, func() error, func(domain.Screen) error) (string, error)
+	Inbox domain.InboxStore
 	// Config saves config.json when /observers changes the observer list;
 	// nil refuses the change with a notice.
 	Config        domain.ConfigStore
@@ -131,6 +134,38 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 				b.log.Warn("[FIX] bridge async result not accepted", slog.String("err", err.Error()))
 			}
 		})
+	}
+	// A shell command may remain unrecorded after successful submission. Its
+	// watcher is intentionally not subject to asyncTimeout and never resends.
+	in.asyncLong = func(run func(context.Context) any) {
+		parent := b.runCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			job := run(parent)
+			if parent.Err() == nil {
+				if err := b.SubmitContext(parent, job); err != nil && parent.Err() == nil {
+					b.log.Warn("shell result not accepted", slog.String("err", err.Error()))
+				}
+			}
+		}()
+	}
+	in.submitShellAck = func(ack shellAck) error {
+		parent := b.runCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		return b.SubmitContext(parent, ack)
+	}
+	in.submitShellProgress = func(progress shellProgress) error {
+		parent := b.runCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		return b.SubmitContext(parent, progress)
 	}
 	in.transferAsync = func(run func(context.Context) transferResult) {
 		b.spawnTransfer(run)
@@ -312,7 +347,7 @@ func (b *Bridge) SubmitContext(ctx context.Context, job any) error {
 	switch job.(type) {
 	case AgentEvent:
 		queue = b.jobs
-	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, updateCheckResult, updateStartResult:
+	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, shellResult, shellAck, shellProgress, shellStatusResult, updateCheckResult, updateStartResult:
 		queue = b.control
 	default:
 		b.log.Warn("bridge job of unknown type dropped", slog.String("type", fmt.Sprintf("%T", job)))
@@ -519,6 +554,14 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 		b.run(ctx, "inbox_result", func(ctx context.Context) error { return b.in.InboxFinished(ctx, j) })
 	case transferResult:
 		b.run(ctx, "transfer_result", func(ctx context.Context) error { return b.in.transferFinished(ctx, j) })
+	case shellResult:
+		b.run(ctx, "shell_result", func(ctx context.Context) error { return b.in.shellFinished(ctx, j) })
+	case shellAck:
+		b.run(ctx, "shell_ack", func(ctx context.Context) error { return b.in.shellAckFinished(ctx, j) })
+	case shellProgress:
+		b.run(ctx, "shell_progress", func(ctx context.Context) error { return b.in.shellProgressFinished(ctx, j) })
+	case shellStatusResult:
+		b.run(ctx, "shell_status", func(ctx context.Context) error { return b.in.shellStatusFinished(ctx, j) })
 	case domain.GeneralCommand:
 		if b.sharingCommand(ctx, j.FromID, j.ChatID, 0, j.MessageID, j.Text) {
 			return

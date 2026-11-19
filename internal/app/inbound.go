@@ -26,6 +26,8 @@ const helpText = `Commands
 /keys k1 k2 ...: send raw keys to the agent (esc, enter, y, 1 ...)
 /focus: bring the agent's pane to the front in Herdr
 /git status | diff [staged] | log [N]: git in the agent's directory; long output arrives as a file
+/shell "command": run one OpenCode shell command while it is idle; its recorded output is posted when complete (exit status is unavailable)
+/shell-status: request a read-only snapshot of the current visible OpenCode screen, even while a command is running
 /stop: send esc to the agent (soft cancel of the running turn or dialog)
 /interrupt: send ctrl+c to the agent (hard interrupt)
 /close: close the agent's pane after a Yes/No confirmation
@@ -157,16 +159,21 @@ type inbound struct {
 	pickers map[domain.Key]heldPicker
 	// git runs /git in the agent's directory; inbox keeps attachments.
 	// Either may be nil, which refuses the feature with a notice.
-	git              domain.GitRunner
-	inbox            domain.InboxStore
-	exportTranscript func(context.Context, domain.Agent) ([]byte, error)
+	git                 domain.GitRunner
+	shell               func(context.Context, domain.Agent, string, func() error, func(domain.Screen) error) (string, error)
+	submitShellAck      func(shellAck) error
+	submitShellProgress func(shellProgress) error
+	shellPending        map[domain.Key]bool
+	inbox               domain.InboxStore
+	exportTranscript    func(context.Context, domain.Agent) ([]byte, error)
 	// closing is the message id of the active /close question per agent;
 	// a newer question retires the older one. Bridge goroutine only.
 	closing map[domain.Key]int
 	// async runs a slow agent start off the bridge goroutine and delivers
 	// its result to StartFinished; the bridge wires it, tests without a
 	// bridge get the synchronous default.
-	async func(run func(context.Context) any)
+	async     func(run func(context.Context) any)
+	asyncLong func(func(context.Context) any)
 	// albums collects the parts of a media group until albumSettle passes
 	// after the last one; the debouncer key is albumKey(groupID).
 	albums map[string]*album
@@ -209,7 +216,7 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 	}
 	in := &inbound{
 		herdr: herdr, tg: tg, topics: topics, agents: agents, live: live, out: out,
-		git: svc.Git, inbox: svc.Inbox, exportTranscript: svc.ExportTranscript,
+		git: svc.Git, shell: svc.Shell, inbox: svc.Inbox, exportTranscript: svc.ExportTranscript,
 		opts: opts, panel: newPanel(opts, tg, log),
 		cfg: cfg, store: svc.Config, log: log,
 		chrome:        opts.PostsChrome,
@@ -221,10 +228,12 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 		albums:        map[string]*album{},
 		answers:       map[string]entryAnswer{},
 		transferSlots: make(chan struct{}, 2),
+		shellPending:  map[domain.Key]bool{},
 	}
 	in.async = func(run func(context.Context) any) {
 		_ = in.asyncDone(context.Background(), run(context.Background()))
 	}
+	in.asyncLong = in.async
 	in.transferAsync = func(run func(context.Context) transferResult) {
 		_ = in.asyncDone(context.Background(), run(context.Background()))
 	}
@@ -241,6 +250,14 @@ func (i *inbound) asyncDone(ctx context.Context, job any) error {
 		return i.InboxFinished(ctx, j)
 	case transferResult:
 		return i.transferFinished(ctx, j)
+	case shellResult:
+		return i.shellFinished(ctx, j)
+	case shellAck:
+		return i.shellAckFinished(ctx, j)
+	case shellProgress:
+		return i.shellProgressFinished(ctx, j)
+	case shellStatusResult:
+		return i.shellStatusFinished(ctx, j)
 	}
 	return nil
 }
@@ -332,6 +349,10 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		})
 	case domain.CmdGit:
 		return i.gitCommand(ctx, msg, key, agent, cmd.Git)
+	case domain.CmdShell:
+		return i.shellCommand(ctx, msg, key, agent, cmd.Shell)
+	case domain.CmdShellStatus:
+		return i.shellStatusCommand(ctx, msg, key, agent)
 	case domain.CmdExport:
 		return i.exportCommand(ctx, msg, key, agent)
 	case domain.CmdTransfer:
@@ -1575,6 +1596,24 @@ func (i *inbound) postPromptNotice(ctx context.Context, key domain.Key, threadID
 // reply posts a silent message quoting the operator's message.
 func (i *inbound) reply(ctx context.Context, threadID, messageID int, text string) error {
 	return i.absorb(i.send(ctx, domain.Outgoing{ThreadID: threadID, Text: text, ReplyTo: messageID}))
+}
+
+// replyGuarded uses a captured topic-generation guard at the Telegram dispatch
+// boundary, so reassociation while a send is queued drops the stale reply.
+func (i *inbound) replyGuarded(ctx context.Context, threadID, messageID int, text string, guard domain.DispatchGuard) error {
+	out := domain.Outgoing{ThreadID: threadID, Text: text, ReplyTo: messageID}
+	if guarded, ok := i.tg.(interface {
+		SendGuard(context.Context, domain.Outgoing, domain.DispatchGuard) (int, error)
+	}); ok {
+		_, err := guarded.SendGuard(ctx, out, guard)
+		return i.absorb(err)
+	}
+	call, release, err := guard(ctx)
+	if err != nil {
+		return i.absorb(err)
+	}
+	defer release()
+	return i.absorb(i.send(call, out))
 }
 
 // send posts one message and drops the message id, which replies and
