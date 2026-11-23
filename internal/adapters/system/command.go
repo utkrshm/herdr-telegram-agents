@@ -17,3 +17,12 @@ func command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	hideConsole(cmd)
 	return cmd
 }
+
+// detachedCommand uses the standard command setup but gives the child its
+// own process session and lets it outlive the caller's readiness context.
+func detachedCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := command(ctx, name, args...)
+	cmd.SysProcAttr = detachAttr()
+	cmd.Cancel = func() error { return nil }
+	return cmd
+}

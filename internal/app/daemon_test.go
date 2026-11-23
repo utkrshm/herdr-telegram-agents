@@ -401,34 +401,28 @@ func TestDaemonResyncDeliversSnapshotChangesToBridge(t *testing.T) {
 	}
 }
 
-func TestDaemonExitsWhenSocketGone(t *testing.T) {
+func TestDaemonKeepsTelegramListenerAfterSocketGonePastFormerGrace(t *testing.T) {
 	f := newDaemon(t)
-	f.daemon.SocketGrace = 60 * time.Second
 	f.start(t)
 	f.waitCalls(t, 1)
 	waitFor(t, "initial snapshot", func() bool { return f.herdr.ListCalls() >= 1 })
 
 	f.herdr.FailList(domain.ErrDisconnected)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case err := <-f.done:
-			if err != nil {
-				t.Fatalf("Run = %v, want nil", err)
-			}
-			if elapsed := f.clock.Now().Sub(t0); elapsed < 60*time.Second || elapsed > 90*time.Second {
-				t.Fatalf("exited after %s", elapsed)
-			}
-			if f.herdr.ListCalls() < 5 {
-				t.Fatalf("expected retries while down, got %d list calls", f.herdr.ListCalls())
-			}
-			return
-		default:
-			f.clock.Advance(5 * time.Second)
-			time.Sleep(2 * time.Millisecond)
-		}
+	for range 15 {
+		f.clock.Advance(5 * time.Second)
+		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatal("daemon kept running with a dead socket")
+	if f.herdr.ListCalls() < 5 {
+		t.Fatalf("expected retries while down, got %d list calls", f.herdr.ListCalls())
+	}
+	select {
+	case err := <-f.done:
+		t.Fatalf("Run exited during Herdr outage: %v", err)
+	default:
+	}
+	if err := f.stop(t); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDaemonRecoversWhenSocketReturns(t *testing.T) {

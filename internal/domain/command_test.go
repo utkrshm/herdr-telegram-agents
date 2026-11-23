@@ -356,3 +356,19 @@ func TestParseGit(t *testing.T) {
 		}
 	}
 }
+
+func TestParseHerdrServerCommands(t *testing.T) {
+	for _, test := range []struct {
+		text string
+		want domain.CommandKind
+	}{
+		{"/herdr-stop", domain.CmdHerdrStop},
+		{"/herdr-start", domain.CmdHerdrStart},
+		{"/herdr-stop@agents_bot", domain.CmdHerdrStop},
+		{"/herdr-start extra", domain.CmdUnknown},
+	} {
+		if got := domain.ParseCommand(test.text, "agents_bot").Kind; got != test.want {
+			t.Errorf("ParseCommand(%q).Kind = %q, want %q", test.text, got, test.want)
+		}
+	}
+}

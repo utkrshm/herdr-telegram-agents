@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -19,6 +18,7 @@ import (
 
 const openCodeCommandMarker = "The following tool was executed by the user"
 const openCodeToolRowMaxJSON = openCodeDBMaxOutput - (64 << 10)
+const openCodeCommandPollInterval = 250 * time.Millisecond
 
 // commandWithOperationID appends a shell comment so the stored tool input is
 // unique to this submission without changing a supported single-line command.
@@ -241,12 +241,13 @@ type OpenCodeShell struct {
 var openCodeShellLocks sync.Map
 
 func NewOpenCodeShell(session func(context.Context, string) (domain.SessionTuple, error), readScreen func(context.Context, string) (domain.Screen, error), sendKeys func(context.Context, string, []string) error, sendText func(context.Context, string, string) error) *OpenCodeShell {
-	return &OpenCodeShell{Session: session, ReadScreen: readScreen, SendKeys: sendKeys, SendText: sendText, SQLite: runOpenCodeSQLite, DBPath: defaultOpenCodeDBPath, Poll: 5 * time.Second, OperationID: rand.Text, TransitionWait: 500 * time.Millisecond, TransitionPoll: 20 * time.Millisecond, ProbeTimeout: 5 * time.Second, ScreenProbeTimeout: 150 * time.Millisecond, ProgressAfter: 5 * time.Second}
+	return &OpenCodeShell{Session: session, ReadScreen: readScreen, SendKeys: sendKeys, SendText: sendText, SQLite: runOpenCodeSQLite, DBPath: defaultOpenCodeDBPath, Poll: openCodeCommandPollInterval, OperationID: rand.Text, TransitionWait: 500 * time.Millisecond, TransitionPoll: 20 * time.Millisecond, ProbeTimeout: 5 * time.Second, ScreenProbeTimeout: 150 * time.Millisecond, ProgressAfter: 5 * time.Second}
 }
 
-func (s *OpenCodeShell) Run(ctx context.Context, agent domain.Agent, command string, submitted func() error, progress func(domain.Screen) error) (string, error) {
+func (s *OpenCodeShell) Run(ctx context.Context, agent domain.Agent, command string, submitted func() error, progress func(context.Context, domain.Screen) error) (string, error) {
 	if agent.Kind != domain.OpenCodeKind || agent.SessionDigest == "" || s.Session == nil || s.SQLite == nil || s.DBPath == nil || s.ReadScreen == nil || s.SendKeys == nil || s.SendText == nil {
-		return "", errors.New("OpenCode shell unavailable")
+		s.logPreflightFailure("dependencies-unavailable")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, errors.New("OpenCode shell unavailable"))
 	}
 	idGenerator := s.OperationID
 	if idGenerator == nil {
@@ -254,11 +255,13 @@ func (s *OpenCodeShell) Run(ctx context.Context, agent domain.Agent, command str
 	}
 	toolCommand, err := commandWithOperationID(command, idGenerator())
 	if err != nil {
-		return "", err
+		s.logPreflightFailure("command-correlation-unsupported")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, err)
 	}
 	session, err := s.exactSession(ctx, agent)
 	if err != nil {
-		return "", err
+		s.logPreflightFailure("session-lookup-failed")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, err)
 	}
 	lockValue, _ := openCodeShellLocks.LoadOrStore(session.Value, make(chan struct{}, 1))
 	lock := lockValue.(chan struct{})
@@ -266,111 +269,156 @@ func (s *OpenCodeShell) Run(ctx context.Context, agent domain.Agent, command str
 	case lock <- struct{}{}:
 		defer func() { <-lock }()
 	case <-ctx.Done():
-		return "", ctx.Err()
+		s.logPreflightFailure("session-lock-wait-canceled")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, ctx.Err())
 	}
 	if _, err = s.exactSession(ctx, agent); err != nil {
-		return "", err
+		s.logPreflightFailure("session-changed-before-baseline")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, err)
 	}
 	dbPath, err := s.DBPath()
 	if err != nil {
-		return "", errors.New("OpenCode database unavailable")
+		s.logPreflightFailure("database-path-unavailable")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, errors.New("OpenCode database unavailable"))
 	}
 	baselineCtx, baselineCancel := context.WithTimeout(ctx, s.probeTimeout())
 	baseline, err := snapshotOpenCodeCommand(baselineCtx, s.SQLite, dbPath, session.Value)
 	baselineCancel()
 	if err != nil {
-		return "", errors.New("could not take OpenCode command baseline")
+		s.logPreflightFailure("command-baseline-unavailable")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, errors.New("could not take OpenCode command baseline"))
 	}
 	if _, err = s.exactSession(ctx, agent); err != nil {
-		return "", err
+		s.logPreflightFailure("session-changed-after-baseline")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, err)
 	}
 	screen, err := s.readScreen(ctx, agent.PaneID)
 	if err != nil {
 		slog.Warn("OpenCode shell stopped before key event", "stage", "initial-composer", "screen_read_ok", err == nil)
-		return "", errors.New("OpenCode prompt was not verifiably empty; command not sent")
+		return "", domain.WithShellStage(domain.ShellStagePromptVerification, errors.New("OpenCode prompt was not verifiably empty; command not sent"))
 	}
 	if !openCodeInputIsSafeScreen(screen, true) {
 		if !openCodeInputIsSafeScreen(screen, false) {
 			slog.Warn("OpenCode shell stopped before key event", "stage", "initial-composer", "normal_or_shell_composer", false)
-			return "", errors.New("OpenCode prompt was not verifiably empty; command not sent")
+			return "", domain.WithShellStage(domain.ShellStagePromptVerification, errors.New("OpenCode prompt was not verifiably empty; command not sent"))
 		}
 		if _, err = s.exactSession(ctx, agent); err != nil {
-			return "", err
+			s.logPreflightFailure("session-changed-before-mode-switch")
+			return "", domain.WithShellStage(domain.ShellStagePreflight, err)
 		}
 		if err = s.SendKeys(ctx, agent.PaneID, []string{"!"}); err != nil {
 			slog.Warn("OpenCode shell stopped", "stage", "shell-mode-key", "key_event_ok", false)
-			return "", errors.New("shell-mode key event failed; command not typed")
+			return "", domain.WithShellStage(domain.ShellStageShellModeKey, errors.New("shell-mode key event failed; command not typed"))
 		}
 		if err = s.waitForComposer(ctx, agent.PaneID, func(screen domain.Screen) bool { return openCodeInputIsSafeScreen(screen, true) }); err != nil {
 			slog.Warn("OpenCode shell stopped", "stage", "shell-mode-verification", "key_event_ok", true, "shell_composer", false)
-			return "", errors.New("OpenCode shell mode could not be verified; command not typed")
+			return "", domain.WithShellStage(domain.ShellStageShellModeCheck, errors.New("OpenCode shell mode could not be verified; command not typed"))
 		}
 	}
 	if _, err = s.exactSession(ctx, agent); err != nil {
-		return "", err
+		s.logPreflightFailure("session-changed-before-input")
+		return "", domain.WithShellStage(domain.ShellStagePreflight, err)
 	}
 	if err = s.SendText(ctx, agent.PaneID, toolCommand); err != nil {
 		slog.Warn("OpenCode shell stopped", "stage", "typed-input", "send_text_ok", false)
-		return "", errors.New("shell input failed; command submission is uncertain")
+		return "", domain.WithShellStage(domain.ShellStageTypedInput, errors.New("shell input failed; command submission is uncertain"))
 	}
 	if err = s.waitForComposer(ctx, agent.PaneID, func(screen domain.Screen) bool { return openCodeShellDraftMatchesANSI(screen.ANSI, toolCommand) }); err != nil {
 		slog.Warn("OpenCode shell stopped", "stage", "typed-input-verification", "send_text_ok", true, "draft_match", false)
-		return "", errors.New("typed shell command could not be verified in OpenCode; Enter was not sent")
+		return "", domain.WithShellStage(domain.ShellStageDraftVerification, errors.New("typed shell command could not be verified in OpenCode; Enter was not sent"))
 	}
 	if _, err = s.exactSession(ctx, agent); err != nil {
-		return "", err
+		return "", domain.WithShellStage(domain.ShellStageDraftVerification, err)
 	}
 	preEnterAt := time.Now().UnixMilli()
 	if err = s.SendKeys(ctx, agent.PaneID, []string{"enter"}); err != nil {
-		return "", errors.New("shell submission is uncertain; command will not be resent")
+		return "", domain.WithShellStage(domain.ShellStageEnter, errors.New("shell submission is uncertain; command will not be resent"))
 	}
 	watchCtx, cancelWatch := context.WithCancel(ctx)
 	defer cancelWatch()
-	var completed atomic.Bool
-	s.startProgressSnapshot(watchCtx, &completed, agent.PaneID, progress)
+	var progressState openCodeProgressState
+	s.startProgressSnapshot(watchCtx, &progressState, agent.PaneID, progress)
 	if submitted != nil {
 		_ = submitted()
 	}
 	interval := s.Poll
 	if interval <= 0 {
-		interval = 5 * time.Second
+		interval = openCodeCommandPollInterval
 	}
-	ticker := time.NewTicker(interval)
+	startedAt := time.Now()
+	currentInterval := interval
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
+	lastRecordReadFailed := false
 	for {
 		select {
 		case <-watchCtx.Done():
-			return "", watchCtx.Err()
+			stage := domain.ShellStageRecordWait
+			if lastRecordReadFailed {
+				stage = domain.ShellStageRecordRead
+			}
+			return "", domain.WithShellStage(stage, watchCtx.Err())
 		case <-ticker.C:
 		}
+		if time.Since(startedAt) >= 5*time.Second && currentInterval < 5*time.Second {
+			currentInterval *= 2
+			if currentInterval > 5*time.Second {
+				currentInterval = 5 * time.Second
+			}
+			ticker.Reset(currentInterval)
+		}
+		if watchCtx.Err() != nil {
+			stage := domain.ShellStageRecordWait
+			if lastRecordReadFailed {
+				stage = domain.ShellStageRecordRead
+			}
+			return "", domain.WithShellStage(stage, watchCtx.Err())
+		}
 		if _, err = s.exactSession(watchCtx, agent); err != nil {
-			return "", err
+			stage := domain.ShellStageRecordWait
+			if lastRecordReadFailed {
+				stage = domain.ShellStageRecordRead
+			}
+			return "", domain.WithShellStage(stage, err)
 		}
 		probeCtx, cancelProbe := context.WithTimeout(watchCtx, s.probeTimeout())
 		messages, readErr := readOpenCodeCommandMessages(probeCtx, s.SQLite, dbPath, session.Value, preEnterAt)
 		cancelProbe()
 		if readErr != nil {
+			lastRecordReadFailed = true
 			if errors.Is(readErr, errOpenCodeDBOutputLimit) {
-				return "", domain.ErrShellOutputTooLarge
+				return "", domain.WithShellStage(domain.ShellStageRecordRead, domain.ErrShellOutputTooLarge)
+			}
+			if watchCtx.Err() != nil {
+				return "", domain.WithShellStage(domain.ShellStageRecordRead, watchCtx.Err())
 			}
 			continue
 		}
+		lastRecordReadFailed = false
 		result, complete, matchErr := CorrelateOpenCodeCommand(baseline.ids, messages, toolCommand)
 		if matchErr != nil {
-			return "", matchErr
+			return "", domain.WithShellStage(domain.ShellStageRecordRead, matchErr)
 		}
 		if complete {
 			if _, err = s.exactSession(watchCtx, agent); err != nil {
-				return "", err
+				return "", domain.WithShellStage(domain.ShellStageRecordRead, err)
 			}
 			if !result.OutputPresent {
-				return "", errors.New("OpenCode command output was not verifiable")
+				return "", domain.WithShellStage(domain.ShellStageRecordRead, errors.New("OpenCode command output was not verifiable"))
 			}
-			completed.Store(true)
+			progressState.mu.Lock()
+			progressState.completed = true
+			progressState.mu.Unlock()
 			cancelWatch()
 			return result.Output, nil
 		}
 	}
+}
+
+// logPreflightFailure emits only a fixed reason code. Error text can contain
+// session identifiers, paths, or command data and is intentionally omitted.
+func (s *OpenCodeShell) logPreflightFailure(reason string) {
+	slog.Warn("OpenCode shell preflight failed", "reason", reason)
 }
 
 func (s *OpenCodeShell) waitForComposer(ctx context.Context, pane string, verified func(domain.Screen) bool) error {
@@ -401,7 +449,12 @@ func (s *OpenCodeShell) waitForComposer(ctx context.Context, pane string, verifi
 	}
 }
 
-func (s *OpenCodeShell) startProgressSnapshot(ctx context.Context, completed *atomic.Bool, pane string, progress func(domain.Screen) error) {
+type openCodeProgressState struct {
+	mu        sync.Mutex
+	completed bool
+}
+
+func (s *OpenCodeShell) startProgressSnapshot(ctx context.Context, state *openCodeProgressState, pane string, progress func(context.Context, domain.Screen) error) {
 	if progress == nil {
 		return
 	}
@@ -417,7 +470,10 @@ func (s *OpenCodeShell) startProgressSnapshot(ctx context.Context, completed *at
 			return
 		case <-timer.C:
 		}
-		if completed.Load() {
+		state.mu.Lock()
+		completed := state.completed
+		state.mu.Unlock()
+		if completed {
 			return
 		}
 		screenCtx, cancel := context.WithTimeout(ctx, s.screenProbeTimeout())
@@ -428,10 +484,13 @@ func (s *OpenCodeShell) startProgressSnapshot(ctx context.Context, completed *at
 		} else {
 			snapshot.Text = "OpenCode shell command has no verified result yet.\n" + snapshot.Text
 		}
-		if completed.Load() || ctx.Err() != nil {
+		state.mu.Lock()
+		finished := state.completed
+		state.mu.Unlock()
+		if finished || ctx.Err() != nil {
 			return
 		}
-		_ = progress(snapshot)
+		_ = progress(ctx, snapshot)
 	}()
 }
 

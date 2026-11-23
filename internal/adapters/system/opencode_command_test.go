@@ -1,10 +1,12 @@
 package system
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,25 @@ import (
 
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
 )
+
+func TestOpenCodeShellPreflightLogUsesFixedReasonWithoutSensitiveDetails(t *testing.T) {
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	shell := &OpenCodeShell{}
+	shell.logPreflightFailure("command-baseline-unavailable")
+	got := output.String()
+	if !strings.Contains(got, `"reason":"command-baseline-unavailable"`) {
+		t.Fatalf("fixed preflight reason missing from log: %s", got)
+	}
+	for _, forbidden := range []string{"ses_private", "/private/path", "secret payload"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("sensitive or unrelated detail %q in log: %s", forbidden, got)
+		}
+	}
+}
 
 // Sanitized lower-screen captures from a disposable OpenCode 1.19.6 TUI.
 const (
@@ -394,6 +415,7 @@ func testOpenCodeShellSubmissionFlow(t *testing.T, alreadyShell bool) {
 		t.Fatal("exact draft fixture rejected")
 	}
 	submitted := false
+	var progressCalls atomic.Int32
 	shell := &OpenCodeShell{Session: func(context.Context, string) (domain.SessionTuple, error) { return tuple, nil }, DBPath: func() (string, error) { return "db", nil }, Poll: time.Millisecond, OperationID: func() string { return "request-42" },
 		ReadScreen: func(context.Context, string) (domain.Screen, error) {
 			if reads.Add(1) == 1 {
@@ -437,9 +459,16 @@ func testOpenCodeShellSubmissionFlow(t *testing.T, alreadyShell bool) {
 		},
 	}
 	agent := domain.Agent{Key: domain.Key{PaneID: "pane", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}
-	got, err := shell.Run(context.Background(), agent, "pwd", func() error { submitted = true; return nil }, nil)
+	shell.ProgressAfter = 5 * time.Second
+	got, err := shell.Run(context.Background(), agent, "pwd", func() error { submitted = true; return nil }, func(context.Context, domain.Screen) error {
+		progressCalls.Add(1)
+		return nil
+	})
 	if err != nil || got != "/repo" || !submitted {
 		t.Fatalf("Run=%q err=%v submitted=%v", got, err, submitted)
+	}
+	if progressCalls.Load() != 0 {
+		t.Fatalf("fast completion sent %d progress snapshots before the deadline", progressCalls.Load())
 	}
 	want := []string{"text:pwd # herdr-tg-op:request-42", "key:enter"}
 	if !alreadyShell {
@@ -480,7 +509,8 @@ func TestOpenCodeShellRequiresBoundedModeTransitionAndVisibleDraft(t *testing.T)
 		draftMatches     bool
 		wantKeyCount     int
 		wantText         bool
-	}{{"mode timeout", false, false, 1, false}, {"draft mismatch", true, false, 1, true}} {
+		wantStage        domain.ShellStage
+	}{{"mode timeout", false, false, 1, false, domain.ShellStageShellModeCheck}, {"draft mismatch", true, false, 1, true, domain.ShellStageDraftVerification}} {
 		t.Run(test.name, func(t *testing.T) {
 			tuple := domain.SessionTuple{Source: "herdr:opencode", Agent: domain.OpenCodeKind, Kind: "id", Value: "ses_1"}
 			var reads atomic.Int32
@@ -514,6 +544,9 @@ func TestOpenCodeShellRequiresBoundedModeTransitionAndVisibleDraft(t *testing.T)
 			_, err := shell.Run(context.Background(), domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", nil, nil)
 			if err == nil || len(keys) != test.wantKeyCount || strings.Contains(strings.Join(keys, "|"), "enter") || (entered != "") != test.wantText {
 				t.Fatalf("err=%v keys=%v text=%q", err, keys, entered)
+			}
+			if stage, ok := domain.ShellErrorStage(err); !ok || stage != test.wantStage {
+				t.Fatalf("stage = %q, %v; want %q", stage, ok, test.wantStage)
 			}
 		})
 	}
@@ -575,7 +608,7 @@ func TestOpenCodeShellWaitIsCancelableWithoutResubmit(t *testing.T) {
 	}}
 	done := make(chan error, 1)
 	go func() {
-		_, err := shell.Run(ctx, domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", func() error { close(accepted); return nil }, func(screen domain.Screen) error {
+		_, err := shell.Run(ctx, domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", func() error { close(accepted); return nil }, func(_ context.Context, screen domain.Screen) error {
 			if !strings.Contains(screen.Text, "Shell") {
 				t.Errorf("progress screen=%q", screen.Text)
 			}
@@ -589,6 +622,8 @@ func TestOpenCodeShellWaitIsCancelableWithoutResubmit(t *testing.T) {
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run error=%v", err)
+	} else if stage, ok := domain.ShellErrorStage(err); !ok || (stage != domain.ShellStageRecordWait && stage != domain.ShellStageRecordRead) {
+		t.Fatalf("record watcher stage = %q, %v", stage, ok)
 	}
 	if submits.Load() != 2 {
 		t.Fatalf("key calls=%d", submits.Load())
@@ -628,7 +663,7 @@ func TestOpenCodeProgressSnapshotIsIndependentOfStalledDatabaseProbe(t *testing.
 	}
 	finished := make(chan error, 1)
 	go func() {
-		_, err := shell.Run(ctx, domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", func() error { close(accepted); return nil }, func(snapshot domain.Screen) error {
+		_, err := shell.Run(ctx, domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", func() error { close(accepted); return nil }, func(_ context.Context, snapshot domain.Screen) error {
 			if !strings.Contains(snapshot.Text, "shell command has no verified result yet") {
 				t.Errorf("snapshot=%q", snapshot.Text)
 			}
@@ -646,8 +681,185 @@ func TestOpenCodeProgressSnapshotIsIndependentOfStalledDatabaseProbe(t *testing.
 	}
 	if err := <-finished; !errors.Is(err, context.Canceled) {
 		t.Fatalf("watcher error=%v", err)
+	} else if stage, ok := domain.ShellErrorStage(err); !ok || stage != domain.ShellStageRecordRead {
+		t.Fatalf("database-read stage = %q, %v", stage, ok)
 	}
 	if keys.Load() != 2 {
 		t.Fatalf("key events=%d, want ! and enter only", keys.Load())
+	}
+}
+
+func TestOpenCodeProgressSnapshotDoesNotRaceCompletedResult(t *testing.T) {
+	started := make(chan struct{})
+	finishRead := make(chan struct{})
+	progressed := make(chan struct{}, 1)
+	state := &openCodeProgressState{}
+	shell := &OpenCodeShell{
+		ProgressAfter: 5 * time.Millisecond,
+		ReadScreen: func(context.Context, string) (domain.Screen, error) {
+			close(started)
+			<-finishRead
+			return domain.Screen{Text: "stale snapshot"}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	shell.startProgressSnapshot(ctx, state, "pane", func(context.Context, domain.Screen) error {
+		progressed <- struct{}{}
+		return nil
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot read did not start")
+	}
+	state.mu.Lock()
+	state.completed = true
+	state.mu.Unlock()
+	close(finishRead)
+	select {
+	case <-progressed:
+		t.Fatal("stale snapshot was sent after completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestOpenCodeRunCancelsBlockedProgressWhenResultCompletes(t *testing.T) {
+	tuple := domain.SessionTuple{Source: "herdr:opencode", Agent: domain.OpenCodeKind, Kind: "id", Value: "ses_progress_cancel"}
+	progressStarted := make(chan struct{})
+	var screens atomic.Int32
+	var submittedCommand string
+	var resultReads atomic.Int32
+	shell := &OpenCodeShell{
+		Session: func(context.Context, string) (domain.SessionTuple, error) { return tuple, nil },
+		DBPath:  func() (string, error) { return "db", nil },
+		Poll:    time.Millisecond, ProgressAfter: 5 * time.Millisecond,
+		OperationID: func() string { return "progress-cancel" },
+		ReadScreen: func(context.Context, string) (domain.Screen, error) {
+			switch screens.Add(1) {
+			case 1:
+				return openCodeScreenFixture(openCodeNormalComposerFixture), nil
+			case 2:
+				return openCodeScreenFixture(openCodeShellComposerFixture), nil
+			case 3:
+				return openCodeScreenFixture(openCodeShellDraftFixture(submittedCommand)), nil
+			default:
+				return domain.Screen{Text: "command running"}, nil
+			}
+		},
+		SendKeys: func(context.Context, string, []string) error { return nil },
+		SendText: func(_ context.Context, _, command string) error { submittedCommand = command; return nil },
+		SQLite: func(_ context.Context, _, query string) ([]byte, error) {
+			if strings.Contains(query, "SELECT id FROM") || strings.Contains(query, "LIKE") {
+				return []byte(`[]`), nil
+			}
+			readNumber := resultReads.Add(1)
+			status := "completed"
+			if readNumber == 1 {
+				status = "running"
+			}
+			if readNumber == 2 {
+				<-progressStarted
+			}
+			part := fmt.Sprintf(`{"type":"tool","tool":"bash","state":{"status":%q,"input":{"command":%q},"output":"done"}}`, status, submittedCommand)
+			row := map[string]any{"message_id": "m", "message_data": `{"role":"assistant","parentID":"u"}`, "parent_data": `{"role":"user"}`, "parent_part_data": `{"type":"text","synthetic":true,"text":"The following tool was executed by the user"}`, "part_id": "p", "part_data": part}
+			return json.Marshal([]any{row})
+		},
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		output, err := shell.Run(context.Background(), domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", nil, func(ctx context.Context, _ domain.Screen) error {
+			close(progressStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		if err != nil || output != "done" {
+			t.Errorf("Run = %q, %v", output, err)
+		}
+	}()
+	select {
+	case <-progressStarted:
+	case <-time.After(time.Second):
+		t.Fatal("progress publication did not start")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("Run blocked behind progress publication after result completed")
+	}
+}
+
+func TestOpenCodeShellCancellationDuringDatabaseFailureKeepsRecordReadStage(t *testing.T) {
+	tuple := domain.SessionTuple{Source: "herdr:opencode", Agent: domain.OpenCodeKind, Kind: "id", Value: "ses_cancel_db"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probeStarted := make(chan struct{})
+	databaseReadFailed := make(chan struct{})
+	var sessionCalls atomic.Int32
+	var screenReads atomic.Int32
+	shell := &OpenCodeShell{
+		Session: func(callCtx context.Context, _ string) (domain.SessionTuple, error) {
+			if sessionCalls.Add(1) >= 8 {
+				select {
+				case <-probeStarted:
+				default:
+					close(probeStarted)
+				}
+				<-callCtx.Done()
+				return domain.SessionTuple{}, callCtx.Err()
+			}
+			return tuple, nil
+		},
+		DBPath:      func() (string, error) { return "db", nil },
+		Poll:        time.Millisecond,
+		OperationID: func() string { return "cancel-db" },
+		ReadScreen: func(context.Context, string) (domain.Screen, error) {
+			switch screenReads.Add(1) {
+			case 1:
+				return openCodeScreenFixture(openCodeNormalComposerFixture), nil
+			case 2:
+				return openCodeScreenFixture(openCodeShellComposerFixture), nil
+			default:
+				return openCodeScreenFixture(openCodeShellDraftFixture("pwd # herdr-tg-op:cancel-db")), nil
+			}
+		},
+		SendKeys: func(context.Context, string, []string) error { return nil },
+		SendText: func(context.Context, string, string) error { return nil },
+		SQLite: func(_ context.Context, _, query string) ([]byte, error) {
+			if strings.Contains(query, "SELECT id FROM") || strings.Contains(query, "LIKE") {
+				return []byte(`[]`), nil
+			}
+			select {
+			case <-databaseReadFailed:
+			default:
+				close(databaseReadFailed)
+			}
+			return nil, errors.New("private database path and credentials")
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := shell.Run(ctx, domain.Agent{Key: domain.Key{PaneID: "p", SessionDigest: tuple.Digest()}, Kind: domain.OpenCodeKind}, "pwd", nil, nil)
+		done <- err
+	}()
+	select {
+	case <-databaseReadFailed:
+	case <-time.After(time.Second):
+		t.Fatal("record database read did not fail")
+	}
+	select {
+	case <-probeStarted:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("post-failure session lookup did not start")
+	}
+	select {
+	case err := <-done:
+		if stage, ok := domain.ShellErrorStage(err); !ok || stage != domain.ShellStageRecordRead {
+			t.Fatalf("database failure mislabeled as %q (known=%v)", stage, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shell watcher did not finish after cancellation")
 	}
 }

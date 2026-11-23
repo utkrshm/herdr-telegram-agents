@@ -49,9 +49,10 @@ type Bridge struct {
 	wg     sync.WaitGroup
 
 	// CallTimeout bounds one job; tests shorten it.
-	CallTimeout     time.Duration
-	transferTimeout time.Duration
-	pendingUpdate   *domain.UpdateJob
+	CallTimeout        time.Duration
+	transferTimeout    time.Duration
+	herdrServerTimeout time.Duration
+	pendingUpdate      *domain.UpdateJob
 }
 
 // RestoreUpdate schedules a persisted progress view for the first bridge
@@ -71,7 +72,7 @@ type Services struct {
 	Git              domain.GitRunner
 	// Shell runs one already-validated OpenCode shell request through its
 	// transcript store. It returns only after an exact result is recorded.
-	Shell func(context.Context, domain.Agent, string, func() error, func(domain.Screen) error) (string, error)
+	Shell func(context.Context, domain.Agent, string, func() error, func(context.Context, domain.Screen) error) (string, error)
 	Inbox domain.InboxStore
 	// Config saves config.json when /observers changes the observer list;
 	// nil refuses the change with a notice.
@@ -80,6 +81,10 @@ type Services struct {
 	UpdateJobs    domain.UpdateJobStore
 	LaunchUpdate  func(context.Context, string) (int, error)
 	UpdateRunning func() bool
+	// HerdrServer controls only the configured default Herdr server. The
+	// callback is invoked off the bridge loop because stopping it disconnects
+	// this daemon's Herdr socket.
+	HerdrServer func(context.Context, bool) error
 }
 
 // NewBridge wires the outbound and inbound use cases around the registry,
@@ -101,19 +106,20 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 	out := newOutbound(herdr, tg, cfg.ChatID, cfg.OperatorIDs, topics, registry.Agent, registry.Live, capture, opts, svc.Replies, clock, log)
 	in := newInbound(herdr, tg, topics, registry.Agent, registry.Live, out, opts, svc, cfg, clock, log)
 	b := &Bridge{
-		out:             out,
-		in:              in,
-		jobs:            make(chan any, bridgeBuffer),
-		control:         make(chan any, bridgeBuffer),
-		privateJobs:     make(chan any, 32),
-		ownerReplies:    make(chan ownerReply, ownerReplyCapacity),
-		ownerReplySlots: make(chan struct{}, ownerReplyCapacity),
-		ownerNoticeSlot: make(chan struct{}, 1),
-		promptNotices:   make(chan promptNotice, 64),
-		fatal:           make(chan error, 1),
-		log:             log,
-		CallTimeout:     bridgeCallTimeout,
-		transferTimeout: transferWorkerTimeout,
+		out:                out,
+		in:                 in,
+		jobs:               make(chan any, bridgeBuffer),
+		control:            make(chan any, bridgeBuffer),
+		privateJobs:        make(chan any, 32),
+		ownerReplies:       make(chan ownerReply, ownerReplyCapacity),
+		ownerReplySlots:    make(chan struct{}, ownerReplyCapacity),
+		ownerNoticeSlot:    make(chan struct{}, 1),
+		promptNotices:      make(chan promptNotice, 64),
+		fatal:              make(chan error, 1),
+		log:                log,
+		CallTimeout:        bridgeCallTimeout,
+		transferTimeout:    transferWorkerTimeout,
+		herdrServerTimeout: asyncTimeout,
 	}
 	in.panel.chatID, in.panel.operators = cfg.ChatID, append([]int64(nil), cfg.OperatorIDs...)
 	in.panel.updates, in.panel.jobs = svc.Updates, svc.UpdateJobs
@@ -153,6 +159,28 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 			}
 		}()
 	}
+	in.herdrServerAsync = func(run func(context.Context) herdrServerResult) {
+		parent := b.runCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			timeout := b.herdrServerTimeout
+			if timeout <= 0 {
+				timeout = asyncTimeout
+			}
+			workCtx, cancel := context.WithTimeout(parent, timeout)
+			result := run(workCtx)
+			cancel()
+			if parent.Err() == nil {
+				if err := b.SubmitContext(parent, result); err != nil && parent.Err() == nil {
+					b.log.Warn("Herdr server result not accepted", slog.String("err", err.Error()))
+				}
+			}
+		}()
+	}
 	in.submitShellAck = func(ack shellAck) error {
 		parent := b.runCtx
 		if parent == nil {
@@ -166,6 +194,9 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 			parent = context.Background()
 		}
 		return b.SubmitContext(parent, progress)
+	}
+	in.submitShellProgressContext = func(ctx context.Context, progress shellProgress) error {
+		return b.SubmitContext(ctx, progress)
 	}
 	in.transferAsync = func(run func(context.Context) transferResult) {
 		b.spawnTransfer(run)
@@ -347,7 +378,7 @@ func (b *Bridge) SubmitContext(ctx context.Context, job any) error {
 	switch job.(type) {
 	case AgentEvent:
 		queue = b.jobs
-	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, shellResult, shellAck, shellProgress, shellStatusResult, updateCheckResult, updateStartResult:
+	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, shellResult, shellAck, shellProgress, shellStatusResult, updateCheckResult, updateStartResult, herdrServerResult:
 		queue = b.control
 	default:
 		b.log.Warn("bridge job of unknown type dropped", slog.String("type", fmt.Sprintf("%T", job)))
@@ -567,6 +598,13 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 			return
 		}
 		b.log.Debug("bridge job", slog.String("kind", "general_command"), slog.Int("message_id", j.MessageID), slog.String("role", j.Role.String()))
+		parsed := domain.ParseCommand(j.Text, b.in.cfg.BotUsername)
+		if parsed.Kind == domain.CmdHerdrStop || parsed.Kind == domain.CmdHerdrStart {
+			b.run(ctx, "herdr_server_ack", func(ctx context.Context) error {
+				return b.in.HandleHerdrServer(ctx, j, parsed.Kind == domain.CmdHerdrStop)
+			})
+			return
+		}
 		b.run(ctx, "general_command", func(ctx context.Context) error { return b.in.HandleGeneral(ctx, j) })
 	case domain.StrangerSeen:
 		b.log.Debug("bridge job", slog.String("kind", "stranger_seen"), slog.Int64("from_id", j.FromID), slog.Int("thread_id", j.ThreadID))
@@ -581,7 +619,25 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 		b.run(ctx, "update_check_result", func(ctx context.Context) error { return b.in.panel.checkFinished(ctx, j) })
 	case updateStartResult:
 		b.run(ctx, "update_start_result", func(ctx context.Context) error { return b.in.panel.startFinished(ctx, j) })
+	case herdrServerResult:
+		b.in.herdrServerBusy = false
+		text := "✅ Herdr server is running. The Telegram listener will reconnect to it."
+		if j.stop {
+			text = "✅ Herdr server stopped. All Herdr agents and processes have been terminated; previous sessions are not guaranteed to resume."
+		}
+		if j.err != nil {
+			text = "⚠️ Herdr server control failed: " + j.err.Error()
+		}
+		b.run(ctx, "herdr_server_result", func(ctx context.Context) error {
+			return b.in.reply(ctx, 0, j.messageID, text)
+		})
 	}
+}
+
+type herdrServerResult struct {
+	messageID int
+	stop      bool
+	err       error
 }
 
 // run executes one job under the call timeout and applies the error policy.

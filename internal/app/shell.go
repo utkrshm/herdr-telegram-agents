@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
 )
@@ -16,6 +17,13 @@ type shellResult struct {
 	output     string
 	err        error
 	submitted  bool
+	lifecycle  *shellLifecycle
+}
+
+// The bridge checks this when dequeuing progress so queued snapshots are
+// discarded after their shell operation has finished.
+type shellLifecycle struct {
+	finished atomic.Bool
 }
 
 type shellAck struct {
@@ -29,6 +37,7 @@ type shellProgress struct {
 	threadID, messageID int
 	generation          *topicGeneration
 	screen              string
+	lifecycle           *shellLifecycle
 }
 
 type shellStatusResult struct {
@@ -131,6 +140,8 @@ func (i *inbound) shellCommand(ctx context.Context, msg domain.TopicMessage, key
 			return shellResult{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, generation: generation, err: errors.New("could not verify an idle OpenCode prompt; command not sent")}
 		}
 		wasSubmitted := false
+		lifecycle := &shellLifecycle{}
+		defer lifecycle.finished.Store(true)
 		submitted := func() error {
 			wasSubmitted = true
 			ack := shellAck{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, generation: generation}
@@ -139,15 +150,15 @@ func (i *inbound) shellCommand(ctx context.Context, msg domain.TopicMessage, key
 			}
 			return i.shellAckFinished(guardedCtx, ack)
 		}
-		progress := func(screen domain.Screen) error {
-			job := shellProgress{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, generation: generation, screen: screen.Text}
+		progress := func(progressCtx context.Context, screen domain.Screen) error {
+			job := shellProgress{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, generation: generation, screen: screen.Text, lifecycle: lifecycle}
 			if i.submitShellProgress != nil {
-				return i.submitShellProgress(job)
+				return i.submitShellProgressContext(progressCtx, job)
 			}
-			return i.shellProgressFinished(guardedCtx, job)
+			return i.shellProgressFinished(progressCtx, job)
 		}
 		output, err := i.shell(guardedCtx, current, command, submitted, progress)
-		return shellResult{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, generation: generation, output: output, err: err, submitted: wasSubmitted}
+		return shellResult{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, generation: generation, output: output, err: err, submitted: wasSubmitted, lifecycle: lifecycle}
 	})
 	return nil
 }
@@ -159,6 +170,17 @@ func (i *inbound) shellTargetCurrent(key domain.Key, threadID int, generation *t
 
 func (i *inbound) shellFinished(ctx context.Context, result shellResult) error {
 	delete(i.shellPending, result.key)
+	if result.err != nil && i.log != nil {
+		stage := domain.ShellStage("")
+		if errors.Is(result.err, domain.ErrShellOutputTooLarge) {
+			stage = domain.ShellStageRecordRead
+		} else if known, ok := domain.ShellErrorStage(result.err); ok {
+			stage = known
+		}
+		if stage != "" {
+			i.log.Warn("OpenCode shell failed", "stage", string(stage), "submitted", result.submitted)
+		}
+	}
 	if !i.shellTargetCurrent(result.key, result.threadID, result.generation) {
 		return nil
 	}
@@ -168,6 +190,11 @@ func (i *inbound) shellFinished(ctx context.Context, result shellResult) error {
 	if result.err != nil {
 		if errors.Is(result.err, domain.ErrShellOutputTooLarge) {
 			return i.reply(ctx, result.threadID, result.messageID, "OpenCode shell result exceeds the 8 MiB safe read limit. No partial output was delivered, and the command was not rerun.")
+		}
+		if stage, ok := domain.ShellErrorStage(result.err); ok {
+			if message := shellStageMessage(stage); message != "" {
+				return i.reply(ctx, result.threadID, result.messageID, message)
+			}
 		}
 		if result.submitted {
 			return i.reply(ctx, result.threadID, result.messageID, "OpenCode accepted the command, but its recorded result is unavailable. It was not resent; check the agent before retrying.")
@@ -189,6 +216,32 @@ func (i *inbound) shellFinished(ctx context.Context, result shellResult) error {
 	return i.reply(ctx, result.threadID, result.messageID, text)
 }
 
+// shellStageMessage returns fixed safe text; error details are never included.
+func shellStageMessage(stage domain.ShellStage) string {
+	switch stage {
+	case domain.ShellStagePreflight:
+		return "OpenCode could not complete shell preflight; command text was not sent. Check the pane before retrying."
+	case domain.ShellStagePromptVerification:
+		return "OpenCode could not verify a safe prompt; command text was not sent. Check the pane before retrying."
+	case domain.ShellStageShellModeKey:
+		return "OpenCode could not confirm the shell-mode switch; command text was not sent. Check the pane before retrying."
+	case domain.ShellStageShellModeCheck:
+		return "OpenCode shell mode could not be verified; command text was not sent. Check the pane before retrying."
+	case domain.ShellStageTypedInput:
+		return "OpenCode could not confirm typed input; command submission is uncertain. Check the pane before retrying."
+	case domain.ShellStageDraftVerification:
+		return "OpenCode could not verify the typed draft; Enter was not sent. Check the pane before retrying."
+	case domain.ShellStageEnter:
+		return "OpenCode could not confirm Enter; command submission is uncertain. Check the pane before retrying."
+	case domain.ShellStageRecordWait:
+		return "Enter was sent, but the recorded result is not available yet. It was not resent; check the pane before retrying."
+	case domain.ShellStageRecordRead:
+		return "Enter was sent, but the recorded result could not be verified. It was not resent; check the pane before retrying."
+	default:
+		return ""
+	}
+}
+
 func (i *inbound) shellAckFinished(ctx context.Context, ack shellAck) error {
 	if !i.shellTargetCurrent(ack.key, ack.threadID, ack.generation) {
 		return nil
@@ -197,12 +250,44 @@ func (i *inbound) shellAckFinished(ctx context.Context, ack shellAck) error {
 }
 
 func (i *inbound) shellProgressFinished(ctx context.Context, progress shellProgress) error {
+	if progress.lifecycle != nil && progress.lifecycle.finished.Load() {
+		return nil
+	}
 	if !i.shellTargetCurrent(progress.key, progress.threadID, progress.generation) {
 		return nil
 	}
 	text := "OpenCode shell watcher progress snapshot:\n" + progress.screen
+	guard := shellProgressDispatchGuard(progress.lifecycle, progress.generation.guard)
 	if len(text) > 3500 {
-		return i.tg.SendDocument(ctx, domain.Document{ThreadID: progress.threadID, Name: "opencode-shell-progress.txt", Data: []byte(text), Caption: "OpenCode shell progress snapshot", ReplyTo: progress.messageID})
+		document := domain.Document{ThreadID: progress.threadID, Name: "opencode-shell-progress.txt", Data: []byte(text), Caption: "OpenCode shell progress snapshot", ReplyTo: progress.messageID}
+		if guarded, ok := i.tg.(interface {
+			SendDocumentGuard(context.Context, domain.Document, domain.DispatchGuard) error
+		}); ok {
+			return i.absorb(guarded.SendDocumentGuard(ctx, document, guard))
+		}
+		call, release, err := guard(ctx)
+		if err != nil {
+			return i.absorb(err)
+		}
+		defer release()
+		return i.absorb(i.tg.SendDocument(call, document))
 	}
-	return i.reply(ctx, progress.threadID, progress.messageID, text)
+	return i.replyGuarded(ctx, progress.threadID, progress.messageID, text, guard)
+}
+
+func shellProgressDispatchGuard(lifecycle *shellLifecycle, topicGuard domain.DispatchGuard) domain.DispatchGuard {
+	return func(ctx context.Context) (context.Context, context.CancelFunc, error) {
+		if lifecycle != nil && lifecycle.finished.Load() {
+			return nil, nil, errors.New("shell operation has finished")
+		}
+		callCtx, release, err := topicGuard(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if lifecycle != nil && lifecycle.finished.Load() {
+			release()
+			return nil, nil, errors.New("shell operation has finished")
+		}
+		return callCtx, context.CancelFunc(release), nil
+	}
 }

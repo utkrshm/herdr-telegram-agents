@@ -61,9 +61,11 @@ const (
 	// holds the action and the id.
 	CmdObservers CommandKind = "observers"
 	// CmdUnknown is a slash word the plugin does not know; Text holds it.
-	CmdUnknown CommandKind = "unknown"
-	CmdShare   CommandKind = "share"
-	CmdShares  CommandKind = "shares"
+	CmdUnknown    CommandKind = "unknown"
+	CmdShare      CommandKind = "share"
+	CmdShares     CommandKind = "shares"
+	CmdHerdrStop  CommandKind = "herdr_stop"
+	CmdHerdrStart CommandKind = "herdr_start"
 )
 
 // Key names the control commands send through agent.send_keys.
@@ -535,6 +537,10 @@ func ParseCommand(text, botUsername string) Command {
 		return bareCommand(CmdShellStatus, word, args)
 	case "observers":
 		return parseObservers(args)
+	case "herdr-stop":
+		return bareCommand(CmdHerdrStop, word, args)
+	case "herdr-start":
+		return bareCommand(CmdHerdrStart, word, args)
 	}
 	if rule, ok := forwardRuleFor(word, rest != ""); ok {
 		line := "/" + word

@@ -38,6 +38,8 @@ const helpText = `Commands
 /new <workspace> [kind]: start an agent in a new tab of that workspace (General only; kind defaults to claude)
 /options: settings and update check (General only)
 /observers [add|remove <id>]: list or change who may watch the group without driving agents (General only)
+/herdr-stop: stop the default Herdr server (owner only; terminates every Herdr agent/process; sessions may not resume)
+/herdr-start: start the default Herdr server (owner only)
 /help: this list
 
 While an agent is blocked, y, n, yes, no, 1-9, enter, ok and esc are sent as keys.
@@ -159,13 +161,14 @@ type inbound struct {
 	pickers map[domain.Key]heldPicker
 	// git runs /git in the agent's directory; inbox keeps attachments.
 	// Either may be nil, which refuses the feature with a notice.
-	git                 domain.GitRunner
-	shell               func(context.Context, domain.Agent, string, func() error, func(domain.Screen) error) (string, error)
-	submitShellAck      func(shellAck) error
-	submitShellProgress func(shellProgress) error
-	shellPending        map[domain.Key]bool
-	inbox               domain.InboxStore
-	exportTranscript    func(context.Context, domain.Agent) ([]byte, error)
+	git                        domain.GitRunner
+	shell                      func(context.Context, domain.Agent, string, func() error, func(context.Context, domain.Screen) error) (string, error)
+	submitShellAck             func(shellAck) error
+	submitShellProgress        func(shellProgress) error
+	submitShellProgressContext func(context.Context, shellProgress) error
+	shellPending               map[domain.Key]bool
+	inbox                      domain.InboxStore
+	exportTranscript           func(context.Context, domain.Agent) ([]byte, error)
 	// closing is the message id of the active /close question per agent;
 	// a newer question retires the older one. Bridge goroutine only.
 	closing map[domain.Key]int
@@ -183,9 +186,12 @@ type inbound struct {
 	// typed are prompts typed into a pane, waiting for the screen check
 	// that they left the input box, one per pane; the debouncer key is
 	// typedKey(pane).
-	typedChecks   map[string]typedCheck
-	transferSlots chan struct{}
-	transferAsync func(func(context.Context) transferResult)
+	typedChecks      map[string]typedCheck
+	transferSlots    chan struct{}
+	transferAsync    func(func(context.Context) transferResult)
+	herdrServer      func(context.Context, bool) error
+	herdrServerAsync func(func(context.Context) herdrServerResult)
+	herdrServerBusy  bool
 }
 
 // followUp is a forwarded command waiting for its settle timer: which
@@ -228,6 +234,7 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 		albums:        map[string]*album{},
 		answers:       map[string]entryAnswer{},
 		transferSlots: make(chan struct{}, 2),
+		herdrServer:   svc.HerdrServer,
 		shellPending:  map[domain.Key]bool{},
 	}
 	in.async = func(run func(context.Context) any) {
@@ -235,6 +242,9 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 	}
 	in.asyncLong = in.async
 	in.transferAsync = func(run func(context.Context) transferResult) {
+		_ = in.asyncDone(context.Background(), run(context.Background()))
+	}
+	in.herdrServerAsync = func(run func(context.Context) herdrServerResult) {
 		_ = in.asyncDone(context.Background(), run(context.Background()))
 	}
 	return in
@@ -258,7 +268,45 @@ func (i *inbound) asyncDone(ctx context.Context, job any) error {
 		return i.shellProgressFinished(ctx, j)
 	case shellStatusResult:
 		return i.shellStatusFinished(ctx, j)
+	case herdrServerResult:
+		i.herdrServerBusy = false
+		text := "✅ Herdr server is running. The Telegram listener will reconnect to it."
+		if j.stop {
+			text = "✅ Herdr server stopped. All Herdr agents and processes have been terminated; previous sessions are not guaranteed to resume."
+		}
+		if j.err != nil {
+			text = "⚠️ Herdr server control failed: " + j.err.Error()
+		}
+		return i.reply(ctx, 0, j.messageID, text)
 	}
+	return nil
+}
+
+// HandleHerdrServer limits host-wide server control to the first configured
+// operator (the bot owner). The acknowledgement is sent before the process
+// command starts so it can reach Telegram before Herdr shuts down.
+func (i *inbound) HandleHerdrServer(ctx context.Context, cmd domain.GeneralCommand, stop bool) error {
+	if len(i.cfg.OperatorIDs) == 0 || cmd.FromID != i.cfg.OperatorIDs[0] {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ only the bot owner can control the Herdr server")
+	}
+	if i.herdrServerBusy {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ a Herdr server control operation is already running; wait for its result")
+	}
+	if i.herdrServer == nil || i.herdrServerAsync == nil {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ Herdr server control is unavailable in this build")
+	}
+	action, acknowledgement := "start", "Starting the configured default Herdr server …"
+	if stop {
+		action, acknowledgement = "stop", "Stopping the configured default Herdr server …"
+	}
+	if err := i.reply(ctx, 0, cmd.MessageID, acknowledgement); err != nil {
+		return err
+	}
+	i.herdrServerBusy = true
+	i.log.Info("Herdr server control requested", slog.String("action", action), slog.Int64("from_id", cmd.FromID))
+	i.herdrServerAsync(func(workCtx context.Context) herdrServerResult {
+		return herdrServerResult{messageID: cmd.MessageID, stop: stop, err: i.herdrServer(workCtx, stop)}
+	})
 	return nil
 }
 

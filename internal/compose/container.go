@@ -495,7 +495,10 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 		app.Services{Replies: replySources(hg.AgentSessions, hg.AgentSession, openCodeExport, hg.PaneProcesses, started, log), ExportTranscript: transcript.NewOpenCodeReader(hg.AgentSession, exporter.ExportFull, log).Transcript, Git: system.NewGitRunner(log), Shell: shell.Run, Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log),
 			Updates: BuildUpdateManager(env, log), UpdateJobs: state.NewUpdateStore(env.StateDir, log),
 			LaunchUpdate:  func(ctx context.Context, id string) (int, error) { return LaunchUpdateWorker(ctx, env, id, log) },
-			UpdateRunning: func() bool { return BuildSupervisor(env, log).Status().Running }}, clock, log)
+			UpdateRunning: func() bool { return BuildSupervisor(env, log).Status().Running },
+			HerdrServer: func(ctx context.Context, stop bool) error {
+				return system.ControlHerdrServer(ctx, env.BinPath, stop)
+			}}, clock, log)
 	job, jobErr := state.NewUpdateStore(env.StateDir, log).Load(ctx)
 	if jobErr == nil {
 		bridge.RestoreUpdate(job)

@@ -141,6 +141,36 @@ func TestTransferWorkerTimeoutReportsPartialResults(t *testing.T) {
 	}
 }
 
+func TestHerdrControlWorkTimeoutStillReportsAndRejectsConcurrentControl(t *testing.T) {
+	r := newRunningBridge(t, func(_ *bridgeFixture, b *Bridge) {
+		b.herdrServerTimeout = 30 * time.Millisecond
+		b.in.cfg.OperatorIDs = []int64{1}
+		b.in.herdrServer = func(ctx context.Context, _ bool) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 801, FromID: 1, Role: domain.RoleOperator, Text: "/herdr-start"})
+	waitUntil(t, "first Herdr control acknowledgement", func() bool { return len(r.tg.Sent()) == 1 })
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 802, FromID: 1, Role: domain.RoleOperator, Text: "/herdr-stop"})
+	waitUntil(t, "busy response", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 802 && strings.Contains(sent.Text, "already running") {
+				return true
+			}
+		}
+		return false
+	})
+	waitUntil(t, "timed-out result after bridge work context expired", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 801 && strings.Contains(sent.Text, "context deadline exceeded") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 func TestTransferWorkerStopsOnBridgeShutdown(t *testing.T) {
 	r := newRunningBridge(t)
 	r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)

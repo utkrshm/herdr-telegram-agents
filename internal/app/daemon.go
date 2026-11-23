@@ -13,9 +13,6 @@ import (
 )
 
 const (
-	// socketGrace is how long the Herdr socket may be unreachable before
-	// the daemon exits.
-	socketGrace = 60 * time.Second
 	// healthInterval is how often the daemon checks socket reachability.
 	healthInterval = 5 * time.Second
 	// flushTimeout bounds the final edits on shutdown.
@@ -49,7 +46,6 @@ type Daemon struct {
 	clock      domain.Clock
 	log        *slog.Logger
 
-	SocketGrace    time.Duration
 	HealthInterval time.Duration
 	// Version is shown in the General topic's started notice.
 	Version string
@@ -245,10 +241,10 @@ func NewDaemon(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 	d := &Daemon{
 		cfg: cfg, herdr: herdr, tg: tg, registry: registry, reconciler: reconciler, bridge: bridge, capture: capture, dashboard: dashboard,
 		configs: configs, opts: opts, presence: presence, clock: clock, log: log,
-		SocketGrace: socketGrace, HealthInterval: healthInterval,
-		resync: make(chan struct{}, 1),
-		sweep:  make(chan struct{}, 1),
-		probe:  make(chan struct{}, 1),
+		HealthInterval: healthInterval,
+		resync:         make(chan struct{}, 1),
+		sweep:          make(chan struct{}, 1),
+		probe:          make(chan struct{}, 1),
 	}
 	// Option hooks run on the bridge goroutine (the panel calls Set) and
 	// only signal: a resync request for the loop, an icon table for the
@@ -439,8 +435,9 @@ func (d *Daemon) Resync() {
 	}
 }
 
-// Run executes the loop until ctx is done, the Herdr socket stays gone for
-// SocketGrace, or a fatal Telegram error occurs. A cancelled context with a
+// Run executes the loop until ctx is done or a fatal Telegram error occurs.
+// The Telegram listener remains available across Herdr server outages so the
+// owner can restart Herdr remotely. A cancelled context with a
 // cause other than plain cancellation (the poller's fatal errors) is
 // returned as that cause.
 func (d *Daemon) Run(ctx context.Context) error {
@@ -618,12 +615,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-health:
 			health = d.clock.After(d.HealthInterval)
 			d.reportDrops(d.clock.Now())
-			if gone := d.socketGone(start); gone {
-				d.general(ctx, fmt.Sprintf("⏹ %s: Herdr socket unreachable for %s, exiting", d.title(), d.SocketGrace))
-				d.shutdown()
-				d.log.Info("daemon exit", slog.String("reason", "herdr socket gone"))
-				return nil
-			}
+			d.socketGone(start)
 		}
 	}
 }
@@ -816,13 +808,13 @@ func isFatal(err error) bool {
 	return errors.Is(err, domain.ErrBotUnauthorized) || errors.Is(err, domain.ErrPollerConflict) || errors.Is(err, domain.ErrForbidden)
 }
 
-// socketGone reports whether snapshots have been failing for longer than
-// the grace period. It also asks for a retry so recovery is noticed within
-// one health interval rather than one reconcile interval.
-func (d *Daemon) socketGone(start time.Time) bool {
+// socketGone reports the outage and asks for a retry. It never ends the
+// Telegram daemon: Herdr may be intentionally stopped and must remain
+// remotely controllable after any outage duration.
+func (d *Daemon) socketGone(start time.Time) {
 	h := d.registry.Health()
 	if h.LastErr == nil {
-		return false
+		return
 	}
 	since := h.LastOK
 	if since.IsZero() || since.Before(start) {
@@ -830,11 +822,7 @@ func (d *Daemon) socketGone(start time.Time) bool {
 	}
 	down := d.clock.Now().Sub(since)
 	d.log.Warn("herdr socket unreachable", slog.Int64("down_for_ms", down.Milliseconds()), slog.String("err", h.LastErr.Error()))
-	if down >= d.SocketGrace {
-		return true
-	}
 	d.registry.RequestSnapshot()
-	return false
 }
 
 // shutdown posts the stopping notice and flushes pending edits with a

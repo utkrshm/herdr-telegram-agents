@@ -116,6 +116,55 @@ var (
 	ErrReleaseSignature = errors.New("release signature does not verify")
 )
 
+// ShellStage identifies the last safe-to-name phase of an OpenCode shell
+// request. It is deliberately separate from error text, which may contain
+// sensitive transport details.
+type ShellStage string
+
+const (
+	ShellStagePreflight          ShellStage = "preflight"
+	ShellStagePromptVerification ShellStage = "prompt-verification"
+	ShellStageShellModeKey       ShellStage = "shell-mode-key"
+	ShellStageShellModeCheck     ShellStage = "shell-mode-verification"
+	ShellStageTypedInput         ShellStage = "typed-input"
+	ShellStageDraftVerification  ShellStage = "draft-verification"
+	ShellStageEnter              ShellStage = "enter"
+	ShellStageRecordWait         ShellStage = "record-wait"
+	ShellStageRecordRead         ShellStage = "record-read"
+)
+
+// ShellStageError carries a safe stage while retaining the underlying error
+// for local errors.Is/errors.As checks. Callers must not expose Error() text.
+type ShellStageError struct {
+	Stage ShellStage
+	Err   error
+}
+
+func (e *ShellStageError) Error() string { return "OpenCode shell operation failed" }
+func (e *ShellStageError) Unwrap() error { return e.Err }
+
+func WithShellStage(stage ShellStage, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ShellStageError{Stage: stage, Err: err}
+}
+
+func ShellErrorStage(err error) (ShellStage, bool) {
+	var staged *ShellStageError
+	if !errors.As(err, &staged) {
+		return "", false
+	}
+	switch staged.Stage {
+	case ShellStagePreflight, ShellStagePromptVerification, ShellStageShellModeKey,
+		ShellStageShellModeCheck, ShellStageTypedInput, ShellStageDraftVerification,
+		ShellStageEnter, ShellStageRecordWait, ShellStageRecordRead:
+		return staged.Stage, true
+	default:
+		return "", false
+	}
+}
+
 // ChatMigratedError carries the replacement chat id when Telegram reports a
 // migration. It matches ErrChatMigrated under errors.Is.
 type ChatMigratedError struct {
