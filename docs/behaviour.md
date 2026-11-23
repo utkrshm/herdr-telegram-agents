@@ -594,18 +594,22 @@ screen for `/screen`; `/screen N` always reads the screen, and `/screen all`
 uses captured history (see [commands](commands.md)). None of these commands
 carries the summary line or the fold.
 
-Owner transcript replies and requested screens are delivered by a bounded
-background queue, so sending a long response does not hold the command loop.
-Multipart messages show the remaining/total count. A changed topic assignment
-cancels parts not yet dispatched. A failed delivery is not blindly retried:
-the daemon retains the reply and last acknowledged message in an in-memory
-quarantine, reports the failure in General when possible, and continues with
-other queued replies. Quarantine and pending replies do not survive a restart;
-check the agent transcript and daemon logs to recover missing output. The
-queue and quarantine each have 32 slots, with a 4 MiB limit per item. Failed
-items release queue capacity; when quarantine fills, the oldest failure is
-evicted and reported in the logs and, when possible, in General. When the
-queue is full, new output is refused and reported rather than silently discarded.
+## Long output delivery
+
+Transcript replies and requested screens go through a bounded background
+queue, so a long message does not hold up other commands. Multipart messages
+are numbered by chunk and total, such as `(1/3)`. If an agent's topic changes,
+parts that have not been sent yet are cancelled.
+
+The daemon does not blindly retry a failed Telegram send: it keeps the reply
+and last acknowledged message in an in-memory quarantine, reports the failure
+in General when possible, and continues with other queued replies. Neither
+queued replies nor quarantined failures survive a daemon restart; check the
+agent transcript and daemon logs if output appears to be missing. The queue
+and quarantine each hold up to 32 items, with a 4 MiB limit per item. If the
+queue fills, new output is refused and reported. If the quarantine fills, its
+oldest failure is evicted and recorded in the logs and, when possible, in
+General.
 
 ## Turns and reactions
 

@@ -135,6 +135,11 @@ checks, state, and manual commands.
 | [Development](docs/development.md) | Source builds, release process, updater internals |
 | [Testing](docs/testing.md) | Automated gates and manual release checks |
 
+This fork's extra controls and delivery features—including OpenCode shell
+commands, daemon and Herdr controls, file transfer, and local CLI uploads—are
+described in [Commands](docs/commands.md). For step-by-step guidance on local
+uploads, see [the send-file skill](.agents/skills/telegram-send-file/SKILL.md).
+
 ## License
 
 [MIT](LICENSE).

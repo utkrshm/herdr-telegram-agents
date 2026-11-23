@@ -62,6 +62,8 @@ Anything you write in a topic reaches the agent:
 | `/screen` | for idle or done OpenCode, Codex, Antigravity (`agy`), Pi and Muse, the current session's complete last reply rendered with bold, lists, links, and code blocks (for Codex, Antigravity, Pi and Muse the final answer of the last turn, not cut at the screen height); if unavailable, the visible screen. Claude Code and other agents always show the visible screen. Working and blocked agents show their progress or dialog from the screen |
 | `/screen 40` | the visible screen's last 40 lines (max 200), never the reply; the input frame is cut afterwards, so an idle Claude Code pane may answer with fewer than 40 lines |
 | `/screen all` | everything the agent printed since your last message (typed in Herdr or sent here); long output arrives as a `.txt` file |
+| `/shell "<command>"` | OpenCode only. Example: `/shell "pwd"`. Requires an idle agent with no open dialog. See [OpenCode shell commands](#opencode-shell-commands) for safety checks and limits. |
+| `/shell-status` | OpenCode only: takes a background snapshot of up to 80 visible lines. It sends no keys or command, and the screen cannot tell you whether a shell command is still running. |
 | `/export` | OpenCode only: the live, exactly matched session's user and assistant text parts in order as a Markdown document in this topic. Tool calls, reasoning and other non-text parts are excluded. Normal redaction applies. The export fails closed if the session cannot be verified or changes; the OpenCode JSON is limited to 64 MiB and Telegram's hosted bot document limit is 50 MB. Oversized exports fail rather than truncate; 1 GB uploads are not supported. |
 | `/transfer <absolute-path> [<absolute-path> ...]` | Uploads the named local files directly to this topic as documents; no agent is involved. Separate paths with spaces and quote paths containing spaces, for example `/transfer /tmp/a.bin "/tmp/my report.pdf"`. Files must be non-empty regular files and no larger than 49,000,000 bytes (decimal); each file is checked and reported independently. The original bytes are sent without text redaction. A Telegram send failure is not automatically retried because its outcome may be ambiguous. |
 | `/focus` | the pane is brought to the front in Herdr |
@@ -75,7 +77,18 @@ Anything you write in a topic reaches the agent:
 | `/away`, `/here`, `/new`, `/observers` | a hint: these commands live in General |
 | `/help` | the command list |
 
-A prompt gets no reply; the topic icon turns ⚡ meanwhile. With `React to
+A prompt that Herdr accepts gets a quoted `✅ Prompt sent.` reply, followed by
+a code-block snapshot of the screen. The snapshot is simply what was visible
+when the daemon read it; it does not show whether the agent has started or
+finished the work. If the screen cannot be read, you still get the
+acknowledgement and a warning. When Herdr's typed-input fallback cannot verify
+that Enter was accepted, the bot does not say the prompt was sent, though it
+may still post the screen. Screen capture and delivery happen in the
+background, and are dropped if the topic or session changes. These replies
+share the bounded queue described in [Long output delivery](behaviour.md#long-output-delivery);
+queued items are held in memory and are lost if the daemon restarts.
+
+A prompt gets no reply beyond that acknowledgement; the topic icon turns ⚡ meanwhile. With `React to
 prompts` ticked in `/options` (off by default) the message gets 👀 once
 `agent.prompt` accepted it and 👌 when that turn ends (done, or idle for
 5 s); short replies, `/keys` and button presses get no reaction. A quoted `⚠️
@@ -124,6 +137,37 @@ above: the picker stays open for `/keys` and the next plain message is held
 back once. `/models` is refused on other agent kinds, which have no such
 command.
 
+## OpenCode shell commands
+
+Use `/shell` to run a command in the OpenCode agent's shell, for example:
+
+```text
+/shell "pwd"
+```
+
+The agent must be idle, with no dialog open. Enter exactly one quoted,
+single-line command. The plugin refuses unquoted input, extra arguments, and
+syntax it cannot safely match to a result, including here-documents,
+backticks, unquoted `#` comments, and incomplete quoting or escaping. It adds
+a unique comment to the command internally, then looks for that exact command
+in the current OpenCode session.
+
+The bot confirms once Enter has been sent. It checks for a recorded result
+every 250 ms at first, then slows its checks to once every 5 seconds. If the
+command is still running after 5 seconds, the bot posts one snapshot of the
+visible screen. That snapshot is not a reliable way to tell whether the
+command is still running. Output over 3,500 bytes is sent as a text file;
+the recorded-output read is limited to 8 MiB, and larger results are refused
+without partial output.
+
+OpenCode's session record does not include an exit status. A completion reply
+means OpenCode recorded the command as completed, not necessarily that the
+command succeeded. If submission or result checking is uncertain, the bot
+does not retry it; check the pane before trying again. `/shell-status` is
+read-only and shows up to 80 lines of the visible screen. Neither command
+works outside the agent's mapped topic, and results for a topic or session
+that has changed are discarded.
+
 ## Agent control
 
 `/stop` and `/interrupt` send one key through `agent.send_keys` and answer
@@ -139,18 +183,29 @@ same keys and react their own way.
 
 ## Local agent file uploads
 
-From an agent pane, `herdr-tg send-image <path>...` sends each image inline;
-`herdr-tg send-file <path>...` sends each file as its original document (text,
-JSON, source code, images and other file types are not converted). Both accept
-multiple paths and an optional `--pane <id>` selector. Without that selector,
-`HERDR_PANE_ID` must identify the requesting pane. The daemon refreshes Herdr's
-live pane list for every file and refuses missing or ambiguous panes and panes
-without their current open topic mapping. It uses the existing local control
-socket; bot credentials are not passed to the CLI. `send-image` sends photos up
-to 10 MB and sends larger images as documents, with a 50 MB maximum per file;
-`send-file` has the same 50 MB cap. Per-file outcomes are printed, and a failed
-upload is not blindly retried because Telegram may have accepted it despite a
-lost response. The daemon's control socket is restricted to the local user.
+From an agent pane, use `herdr-tg send-image <path>...` to send images as
+Telegram photos, or `herdr-tg send-file <path>...` to send files as documents.
+For example:
+
+```sh
+herdr-tg send-image "./screenshots/diagram 1.png"
+herdr-tg send-file "./reports/final report.pdf"
+```
+
+Both commands accept several paths and an optional `--pane <id>`. Without
+`--pane`, `HERDR_PANE_ID` must identify the requesting pane. Each file is
+checked against Herdr's current pane list and topic mapping before sending;
+the local control socket is restricted to the local user, and bot credentials
+are not passed to the CLI.
+
+Files must be non-empty regular files no larger than 50,000,000 bytes. Images
+over 10,000,000 bytes are sent as documents instead of photos. The original
+file bytes are sent unchanged; the CLI hashes each file and the daemon checks
+the uploaded bytes against that hash. The CLI reports each file's result. It
+does not retry a failed or uncertain send, because Telegram may have received
+the file even if the response was lost. See the
+[send-file skill](../.agents/skills/telegram-send-file/SKILL.md) for agent-facing
+instructions.
 
 `/close` always asks first. `Yes, close` calls `pane.close` on the agent's
 pane, never `tab.close`: a tab with one pane disappears with it, a split
@@ -218,6 +273,8 @@ and the commands appear in Telegram's `/` menu for the group.
 | `/here` | presence is automatic again; where no idle source exists it turns quiet on by hand until `/away` (`🖥 quiet on until /away`); the reply says the current verdict |
 | `/new <workspace> [kind]` | opens an unfocused tab in that workspace (`tab.create`, Herdr's default directory and label) and starts an agent in its root pane (`agent.start`). The workspace is matched by label, case-insensitive: an exact match wins, else a unique prefix (`/new wor` for `Work`); labels may contain spaces. The last word is the kind only when Herdr knows it (`pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `letta`, `maki`, `muse`), default `claude`; no arguments reach the agent. The first reply is `starting <kind> in <workspace> …`, the second, up to a minute later, `started <kind> in <workspace> (pane <id>)` or `⚠️ <kind> did not start in <workspace>: <reason>`; the topic appears through the ordinary sync. A bare `/new`, an unknown or an ambiguous label answer with the workspace list |
 | `/observers`, `/observers add <id>`, `/observers remove <id>` | the operator and observer lists plus the unknown accounts seen recently (name, `@username`, id, when and where); add or remove an observer, saved to `config.json` and applied at once. An observer may use `/status` and `/help` here and nothing else; see [Operators and observers](behaviour.md#operators-and-observers) |
+| `/restart` | Owner only. Restarts the Telegram Agents daemon; Herdr and its agents keep running. The bot acknowledges the request and posts a startup notice when it comes back. A second restart is refused while one is underway. In-memory queued messages are lost on restart; see [Long output delivery](behaviour.md#long-output-delivery). |
+| `/herdr-stop`, `/herdr-start` | Owner only. Stops or starts the default Herdr server. **Stopping Herdr terminates its agent processes**, and those sessions may not resume. This is separate from `/restart`, which restarts only the Telegram Agents daemon. |
 | `/help` | the command list |
 
 `/git`, `/stop`, `/interrupt` and `/close` written in General answer with a
