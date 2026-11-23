@@ -85,6 +85,14 @@ type Services struct {
 	// callback is invoked off the bridge loop because stopping it disconnects
 	// this daemon's Herdr socket.
 	HerdrServer func(context.Context, bool) error
+	// PluginRestart launches a detached supervisor action; it must not restart
+	// Herdr or agents and must outlive the daemon that invokes it. The channel
+	// reports how the helper exited if this daemon remains alive.
+	PluginRestart func(context.Context) (<-chan error, error)
+	// PluginRestartAlive reports whether the daemon that launched the helper
+	// is still running, so a post-launch helper failure is not reported by a
+	// daemon that is already shutting down.
+	PluginRestartAlive func() bool
 }
 
 // NewBridge wires the outbound and inbound use cases around the registry,
@@ -180,6 +188,17 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 				}
 			}
 		}()
+	}
+	in.pluginRestartWatch = func(done <-chan error, messageID int) {
+		parent := b.runCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		watchPluginRestart(parent, done, svc.PluginRestartAlive, func(err error) {
+			if submitErr := b.SubmitContext(parent, pluginRestartResult{messageID: messageID, err: err}); submitErr != nil && parent.Err() == nil {
+				b.log.Warn("plugin restart result not accepted", slog.String("err", submitErr.Error()))
+			}
+		})
 	}
 	in.submitShellAck = func(ack shellAck) error {
 		parent := b.runCtx
@@ -378,7 +397,7 @@ func (b *Bridge) SubmitContext(ctx context.Context, job any) error {
 	switch job.(type) {
 	case AgentEvent:
 		queue = b.jobs
-	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, shellResult, shellAck, shellProgress, shellStatusResult, updateCheckResult, updateStartResult, herdrServerResult:
+	case ownerReplyResult, privateResult, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, domain.StrangerSeen, presenceAway, startResult, inboxResult, transferResult, shellResult, shellAck, shellProgress, shellStatusResult, updateCheckResult, updateStartResult, herdrServerResult, pluginRestartResult:
 		queue = b.control
 	default:
 		b.log.Warn("bridge job of unknown type dropped", slog.String("type", fmt.Sprintf("%T", job)))
@@ -599,6 +618,12 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 		}
 		b.log.Debug("bridge job", slog.String("kind", "general_command"), slog.Int("message_id", j.MessageID), slog.String("role", j.Role.String()))
 		parsed := domain.ParseCommand(j.Text, b.in.cfg.BotUsername)
+		if parsed.Kind == domain.CmdRestart {
+			b.run(ctx, "plugin_restart_ack", func(ctx context.Context) error {
+				return b.in.HandlePluginRestart(ctx, j)
+			})
+			return
+		}
 		if parsed.Kind == domain.CmdHerdrStop || parsed.Kind == domain.CmdHerdrStart {
 			b.run(ctx, "herdr_server_ack", func(ctx context.Context) error {
 				return b.in.HandleHerdrServer(ctx, j, parsed.Kind == domain.CmdHerdrStop)
@@ -631,6 +656,10 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 		b.run(ctx, "herdr_server_result", func(ctx context.Context) error {
 			return b.in.reply(ctx, 0, j.messageID, text)
 		})
+	case pluginRestartResult:
+		b.run(ctx, "plugin_restart_result", func(ctx context.Context) error {
+			return b.in.pluginRestartFinished(ctx, j)
+		})
 	}
 }
 
@@ -638,6 +667,29 @@ type herdrServerResult struct {
 	messageID int
 	stop      bool
 	err       error
+}
+
+type pluginRestartResult struct {
+	messageID int
+	err       error
+}
+
+// watchPluginRestart waits independently of parent cancellation. Only a
+// failed helper whose original daemon is still running is reported.
+func watchPluginRestart(parent context.Context, done <-chan error, daemonAlive func() bool, report func(error)) <-chan struct{} {
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		err, ok := <-done
+		if !ok || err == nil || parent.Err() != nil {
+			return
+		}
+		if daemonAlive != nil && !daemonAlive() {
+			return
+		}
+		report(err)
+	}()
+	return finished
 }
 
 // run executes one job under the call timeout and applies the error policy.

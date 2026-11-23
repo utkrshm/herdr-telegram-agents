@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/permgps/herdr-telegram-agents/internal/adapters/system"
 )
 
 // TestTightenPermissionsOwnedPaths: the daemon start tightens the state and
@@ -26,11 +28,12 @@ func TestTightenPermissionsOwnedPaths(t *testing.T) {
 		}
 	}
 	files := map[string]os.FileMode{
-		filepath.Join(env.ConfigDir, "config.json"):  0o600,
-		filepath.Join(env.ConfigDir, "options.json"): 0o600,
-		filepath.Join(env.StateDir, "mapping.json"):  0o600,
-		filepath.Join(env.StateDir, "daemon.log.2"):  0o600,
-		filepath.Join(env.StateDir, "notes.txt"):     0o644, // not the plugin's
+		filepath.Join(env.ConfigDir, "config.json"):                     0o600,
+		filepath.Join(env.ConfigDir, "options.json"):                    0o600,
+		filepath.Join(env.StateDir, "mapping.json"):                     0o600,
+		filepath.Join(env.StateDir, "daemon.log.2"):                     0o600,
+		filepath.Join(env.StateDir, system.PluginRestartErrLogFileName): 0o600,
+		filepath.Join(env.StateDir, "notes.txt"):                        0o644, // not the plugin's
 	}
 	for path := range files {
 		if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -47,8 +50,8 @@ func TestTightenPermissionsOwnedPaths(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := TightenPermissions(env, nil); n != 6 {
-		t.Errorf("tightened = %d, want 6", n)
+	if n := TightenPermissions(env, nil); n != 7 {
+		t.Errorf("tightened = %d, want 7", n)
 	}
 	for path := range paths {
 		files[path] = 0o700

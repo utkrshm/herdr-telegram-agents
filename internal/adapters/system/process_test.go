@@ -102,6 +102,85 @@ func TestSpawnSurvivesContextCancel(t *testing.T) {
 	waitUntil(t, func() bool { return !p.Alive(pid) }, "child gone after SIGKILL")
 }
 
+func TestPluginRestartSpawnerSubprocess(t *testing.T) {
+	if os.Getenv("HERDR_TG_RESTART_SPAWNER") != "1" {
+		return
+	}
+	_, _, err := launchPluginRestart(context.Background(), os.Getenv("HERDR_TG_RESTART_STATE"), os.Getenv("HERDR_TG_RESTART_SCRIPT"), nil)
+	if err != nil {
+		os.Exit(21)
+	}
+	// Simulate the daemon exiting immediately after launching the detached
+	// supervisor action. The outer test verifies the action still completed.
+	os.Exit(0)
+}
+
+func TestPluginRestartHelperArgsEnvironmentAndParentLifetime(t *testing.T) {
+	dir := t.TempDir()
+	output := filepath.Join(dir, "helper")
+	script := filepath.Join(dir, "restart-helper.sh")
+	body := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HELPER_OUTPUT.args\"\nprintf '%s|%s\\n' \"$HERDR_PLUGIN_ROOT\" \"$HELPER_MARKER\" > \"$HELPER_OUTPUT.env\"\nsleep 0.25\nprintf done > \"$HELPER_OUTPUT.done\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestPluginRestartSpawnerSubprocess$")
+	cmd.Env = append(os.Environ(),
+		"HERDR_TG_RESTART_SPAWNER=1",
+		"HERDR_TG_RESTART_STATE="+filepath.Join(dir, "state"),
+		"HERDR_TG_RESTART_SCRIPT="+script,
+		"HELPER_OUTPUT="+output,
+		"HERDR_PLUGIN_ROOT=/isolated/plugin/root",
+		"HELPER_MARKER=inherited-from-daemon",
+	)
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("spawner subprocess failed: %v\n%s", err, combined)
+	}
+	waitUntil(t, func() bool {
+		_, err := os.Stat(output + ".done")
+		return err == nil
+	}, "detached restart helper after launcher exits")
+
+	args, err := os.ReadFile(output + ".args")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(args) != "action\nrestart\n" {
+		t.Fatalf("helper args = %q, want action restart", args)
+	}
+	env, err := os.ReadFile(output + ".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(env) != "/isolated/plugin/root|inherited-from-daemon\n" {
+		t.Fatalf("helper env = %q", env)
+	}
+}
+
+func TestPluginRestartWaitChannelReportsHelperFailure(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "restart-helper.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 9\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, done, err := launchPluginRestart(context.Background(), filepath.Join(dir, "state"), script, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 9 {
+			t.Fatalf("helper exit = %v, want exit status 9", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("restart helper exit was not observed")
+	}
+}
+
 // TestStopPrefersControlChannel checks the order the actions rely on: a
 // listening daemon is asked politely and never signalled, and a daemon
 // without a channel still gets SIGTERM.

@@ -66,6 +66,8 @@ const (
 	CmdShares     CommandKind = "shares"
 	CmdHerdrStop  CommandKind = "herdr_stop"
 	CmdHerdrStart CommandKind = "herdr_start"
+	// CmdRestart restarts only the Telegram Agents daemon (General only).
+	CmdRestart CommandKind = "restart"
 )
 
 // Key names the control commands send through agent.send_keys.
@@ -541,6 +543,8 @@ func ParseCommand(text, botUsername string) Command {
 		return bareCommand(CmdHerdrStop, word, args)
 	case "herdr-start":
 		return bareCommand(CmdHerdrStart, word, args)
+	case "restart":
+		return bareCommand(CmdRestart, word, args)
 	}
 	if rule, ok := forwardRuleFor(word, rest != ""); ok {
 		line := "/" + word

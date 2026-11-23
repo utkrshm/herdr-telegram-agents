@@ -72,7 +72,7 @@ func TestParseCommand(t *testing.T) {
 		{"bot suffix with args", "/screen@herdr_bot 5", "herdr_bot", domain.Command{Kind: domain.CmdScreen, Lines: 5}},
 		{"any suffix when username unknown", "/help@whatever", "", domain.Command{Kind: domain.CmdHelp}},
 		{"other bot", "/help@other_bot", "herdr_bot", domain.Command{Kind: domain.CmdUnknown, Text: "/help@other_bot"}},
-		{"unknown word", "/restart now", "herdr_bot", domain.Command{Kind: domain.CmdUnknown, Text: "/restart"}},
+		{"restart with argument", "/restart now", "herdr_bot", domain.Command{Kind: domain.CmdUnknown, Text: "/restart now"}},
 		{"leading whitespace before slash", "  /focus", "herdr_bot", domain.Command{Kind: domain.CmdFocus}},
 		{"forward clear", "/clear", "herdr_bot", domain.Command{Kind: domain.CmdForward, Text: "/clear", Forward: domain.ForwardRule{Post: domain.ForwardPostTail}}},
 		{"forward clear upper case with bot suffix", "/CLEAR@herdr_bot", "herdr_bot", domain.Command{Kind: domain.CmdForward, Text: "/clear", Forward: domain.ForwardRule{Post: domain.ForwardPostTail}}},
@@ -366,6 +366,22 @@ func TestParseHerdrServerCommands(t *testing.T) {
 		{"/herdr-start", domain.CmdHerdrStart},
 		{"/herdr-stop@agents_bot", domain.CmdHerdrStop},
 		{"/herdr-start extra", domain.CmdUnknown},
+	} {
+		if got := domain.ParseCommand(test.text, "agents_bot").Kind; got != test.want {
+			t.Errorf("ParseCommand(%q).Kind = %q, want %q", test.text, got, test.want)
+		}
+	}
+}
+
+func TestParsePluginRestartCommand(t *testing.T) {
+	for _, test := range []struct {
+		text string
+		want domain.CommandKind
+	}{
+		{"/restart", domain.CmdRestart},
+		{"/restart@agents_bot", domain.CmdRestart},
+		{"/restart now", domain.CmdUnknown},
+		{"/restart@other_bot", domain.CmdUnknown},
 	} {
 		if got := domain.ParseCommand(test.text, "agents_bot").Kind; got != test.want {
 			t.Errorf("ParseCommand(%q).Kind = %q, want %q", test.text, got, test.want)

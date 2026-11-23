@@ -282,7 +282,7 @@ func TightenPermissions(env PluginEnv, log *slog.Logger) int {
 		dirs = append(dirs, env.StateDir, filepath.Join(env.StateDir, state.InboxDirName))
 		names := []string{
 			state.MappingFileName, state.SharingFileName, state.UpdateFileName, state.PidFileName, state.ClaudeUsageFileName,
-			logging.LogFileName, system.ErrLogFileName, system.UpdateWorkerErrLogFileName,
+			logging.LogFileName, system.ErrLogFileName, system.PluginRestartErrLogFileName, system.UpdateWorkerErrLogFileName,
 		}
 		for i := 1; i <= logging.RotateKeep; i++ {
 			names = append(names, fmt.Sprintf("%s.%d", logging.LogFileName, i))
@@ -491,6 +491,8 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 	}, hg.SendKeys, hg.SendText)
 	// The Muse reader ties a pane's pids to their process start times.
 	started := system.NewProcess(env.StateDir, log).StartTime
+	daemonProcess := system.NewProcess(env.StateDir, log)
+	daemonPID := os.Getpid()
 	bridge := app.NewBridge(cfg, hg, tg, registry, reconciler, capture, opts,
 		app.Services{Replies: replySources(hg.AgentSessions, hg.AgentSession, openCodeExport, hg.PaneProcesses, started, log), ExportTranscript: transcript.NewOpenCodeReader(hg.AgentSession, exporter.ExportFull, log).Transcript, Git: system.NewGitRunner(log), Shell: shell.Run, Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log),
 			Updates: BuildUpdateManager(env, log), UpdateJobs: state.NewUpdateStore(env.StateDir, log),
@@ -498,6 +500,13 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 			UpdateRunning: func() bool { return BuildSupervisor(env, log).Status().Running },
 			HerdrServer: func(ctx context.Context, stop bool) error {
 				return system.ControlHerdrServer(ctx, env.BinPath, stop)
+			},
+			PluginRestart: func(ctx context.Context) (<-chan error, error) {
+				_, done, err := system.LaunchPluginRestart(ctx, env.StateDir, log)
+				return done, err
+			},
+			PluginRestartAlive: func() bool {
+				return daemonProcess.Alive(daemonPID)
 			}}, clock, log)
 	job, jobErr := state.NewUpdateStore(env.StateDir, log).Load(ctx)
 	if jobErr == nil {

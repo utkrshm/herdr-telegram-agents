@@ -171,6 +171,105 @@ func TestHerdrControlWorkTimeoutStillReportsAndRejectsConcurrentControl(t *testi
 	})
 }
 
+func TestGeneralRestartRoutesThroughOwnerGuard(t *testing.T) {
+	r := newRunningBridge(t, func(_ *bridgeFixture, b *Bridge) {
+		b.in.cfg.OperatorIDs = []int64{1, 2}
+		b.in.pluginRestart = func(context.Context) (<-chan error, error) {
+			t.Fatal("non-owner launched plugin restart")
+			return nil, nil
+		}
+	})
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 803, FromID: 2, Role: domain.RoleObserver, Text: "/restart"})
+	waitUntil(t, "owner-only restart refusal", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 803 && strings.Contains(sent.Text, "only the bot owner") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestPluginRestartFailureClearsBusyAndAllowsExplicitRetry(t *testing.T) {
+	launched := make(chan chan error, 2)
+	r := newRunningBridge(t, func(_ *bridgeFixture, b *Bridge) {
+		b.in.cfg.OperatorIDs = []int64{1}
+		b.in.pluginRestartAlive = func() bool { return true }
+		b.in.pluginRestart = func(context.Context) (<-chan error, error) {
+			done := make(chan error, 1)
+			launched <- done
+			return done, nil
+		}
+	})
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 804, FromID: 1, Role: domain.RoleOperator, Text: "/restart"})
+	first := receiveRestartLaunch(t, launched)
+	first <- errors.New("exit status 9")
+	waitUntil(t, "post-spawn failure result", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 804 && strings.Contains(sent.Text, "daemon restart helper failed") {
+				return true
+			}
+		}
+		return false
+	})
+	if len(launched) != 0 {
+		t.Fatal("failed helper caused an automatic retry")
+	}
+
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 805, FromID: 1, Role: domain.RoleOperator, Text: "/restart"})
+	second := receiveRestartLaunch(t, launched)
+	waitUntil(t, "retry acknowledgement", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 805 && strings.Contains(sent.Text, "Restarting the Telegram Agents daemon") {
+				return true
+			}
+		}
+		return false
+	})
+	second <- nil
+}
+
+func TestPluginRestartSuccessDoesNotSendFailureNotice(t *testing.T) {
+	launched := make(chan chan error, 1)
+	r := newRunningBridge(t, func(_ *bridgeFixture, b *Bridge) {
+		b.in.cfg.OperatorIDs = []int64{1}
+		b.in.pluginRestartAlive = func() bool { return true }
+		b.in.pluginRestart = func(context.Context) (<-chan error, error) {
+			done := make(chan error)
+			launched <- done
+			return done, nil
+		}
+	})
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 806, FromID: 1, Role: domain.RoleOperator, Text: "/restart"})
+	done := receiveRestartLaunch(t, launched)
+	done <- nil // unblocks the watcher before the following queued command
+	r.bridge.Submit(domain.GeneralCommand{MessageID: 807, FromID: 1, Role: domain.RoleOperator, Text: "/help"})
+	waitUntil(t, "command following successful restart helper", func() bool {
+		for _, sent := range r.tg.Sent() {
+			if sent.ReplyTo == 807 && strings.HasPrefix(sent.Text, "Commands\n") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, sent := range r.tg.Sent() {
+		if sent.ReplyTo == 806 && strings.Contains(sent.Text, "restart helper failed") {
+			t.Fatalf("successful helper got failure notice: %+v", sent)
+		}
+	}
+}
+
+func receiveRestartLaunch(t *testing.T, launched <-chan chan error) chan error {
+	t.Helper()
+	select {
+	case done := <-launched:
+		return done
+	case <-time.After(time.Second):
+		t.Fatal("restart helper did not launch")
+		return nil
+	}
+}
+
 func TestTransferWorkerStopsOnBridgeShutdown(t *testing.T) {
 	r := newRunningBridge(t)
 	r.add(t, "p1", "t1", "reviewer", domain.StatusIdle)

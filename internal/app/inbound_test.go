@@ -238,7 +238,7 @@ func TestInboundStatusHelpUnknown(t *testing.T) {
 	if !strings.HasPrefix(sent[1].Text, "Commands\n/transfer") || !strings.Contains(sent[1].Text, "/clear, /compact [instructions], /usage, /model [name]") || !strings.Contains(sent[1].Text, "buttons") {
 		t.Errorf("help reply = %q", sent[1].Text)
 	}
-	if sent[2].Text != "unknown command, see /help" {
+	if sent[2].Text != "agent commands live in the agent's topic; /restart is available in General" {
 		t.Errorf("unknown reply = %q", sent[2].Text)
 	}
 	if n := len(f.herdr.Prompts()) + len(f.herdr.Keys()); n != 0 {

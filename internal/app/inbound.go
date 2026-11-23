@@ -40,6 +40,7 @@ const helpText = `Commands
 /observers [add|remove <id>]: list or change who may watch the group without driving agents (General only)
 /herdr-stop: stop the default Herdr server (owner only; terminates every Herdr agent/process; sessions may not resume)
 /herdr-start: start the default Herdr server (owner only)
+/restart: restart the Telegram Agents daemon (owner only; agents are not restarted)
 /help: this list
 
 While an agent is blocked, y, n, yes, no, 1-9, enter, ok and esc are sent as keys.
@@ -186,12 +187,16 @@ type inbound struct {
 	// typed are prompts typed into a pane, waiting for the screen check
 	// that they left the input box, one per pane; the debouncer key is
 	// typedKey(pane).
-	typedChecks      map[string]typedCheck
-	transferSlots    chan struct{}
-	transferAsync    func(func(context.Context) transferResult)
-	herdrServer      func(context.Context, bool) error
-	herdrServerAsync func(func(context.Context) herdrServerResult)
-	herdrServerBusy  bool
+	typedChecks        map[string]typedCheck
+	transferSlots      chan struct{}
+	transferAsync      func(func(context.Context) transferResult)
+	herdrServer        func(context.Context, bool) error
+	herdrServerAsync   func(func(context.Context) herdrServerResult)
+	herdrServerBusy    bool
+	pluginRestart      func(context.Context) (<-chan error, error)
+	pluginRestartAlive func() bool
+	pluginRestartWatch func(<-chan error, int)
+	pluginRestartBusy  bool
 }
 
 // followUp is a forwarded command waiting for its settle timer: which
@@ -225,17 +230,19 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 		git: svc.Git, shell: svc.Shell, inbox: svc.Inbox, exportTranscript: svc.ExportTranscript,
 		opts: opts, panel: newPanel(opts, tg, log),
 		cfg: cfg, store: svc.Config, log: log,
-		chrome:        opts.PostsChrome,
-		clock:         clock,
-		deb:           newDebouncer(clock, commandSettle, log),
-		pending:       map[domain.Key]followUp{},
-		pickers:       map[domain.Key]heldPicker{},
-		closing:       map[domain.Key]int{},
-		albums:        map[string]*album{},
-		answers:       map[string]entryAnswer{},
-		transferSlots: make(chan struct{}, 2),
-		herdrServer:   svc.HerdrServer,
-		shellPending:  map[domain.Key]bool{},
+		chrome:             opts.PostsChrome,
+		clock:              clock,
+		deb:                newDebouncer(clock, commandSettle, log),
+		pending:            map[domain.Key]followUp{},
+		pickers:            map[domain.Key]heldPicker{},
+		closing:            map[domain.Key]int{},
+		albums:             map[string]*album{},
+		answers:            map[string]entryAnswer{},
+		transferSlots:      make(chan struct{}, 2),
+		herdrServer:        svc.HerdrServer,
+		pluginRestart:      svc.PluginRestart,
+		pluginRestartAlive: svc.PluginRestartAlive,
+		shellPending:       map[domain.Key]bool{},
 	}
 	in.async = func(run func(context.Context) any) {
 		_ = in.asyncDone(context.Background(), run(context.Background()))
@@ -431,6 +438,8 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		return i.reply(ctx, msg.ThreadID, msg.MessageID, helpText)
 	case domain.CmdOptions:
 		return i.reply(ctx, msg.ThreadID, msg.MessageID, panelInGeneral)
+	case domain.CmdRestart:
+		return i.reply(ctx, msg.ThreadID, msg.MessageID, "agent commands live in the agent's topic; /restart is available in General")
 	case domain.CmdAway, domain.CmdHere:
 		return i.reply(ctx, msg.ThreadID, msg.MessageID, presenceInGeneral)
 	case domain.CmdNew:
@@ -889,6 +898,9 @@ func (i *inbound) HandleGeneral(ctx context.Context, cmd domain.GeneralCommand) 
 		i.log.Debug("observer command dropped", slog.Int64("from_id", cmd.FromID), slog.String("kind", string(parsed.Kind)))
 		return nil
 	}
+	if parsed.Kind == domain.CmdRestart {
+		return i.HandlePluginRestart(ctx, cmd)
+	}
 	switch parsed.Kind {
 	case domain.CmdStatus:
 		text := i.statusSummary(ctx)
@@ -912,6 +924,46 @@ func (i *inbound) HandleGeneral(ctx context.Context, cmd domain.GeneralCommand) 
 	default:
 		return i.reply(ctx, 0, cmd.MessageID, "unknown command, see /help")
 	}
+}
+
+// HandlePluginRestart acknowledges before launching a detached plugin action.
+// The action uses the ordinary supervisor to stop and restart only this daemon.
+func (i *inbound) HandlePluginRestart(ctx context.Context, cmd domain.GeneralCommand) error {
+	if len(i.cfg.OperatorIDs) == 0 || cmd.FromID != i.cfg.OperatorIDs[0] {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ only the bot owner can restart Telegram Agents")
+	}
+	if i.pluginRestartBusy {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ a Telegram Agents restart is already underway; wait for its startup notice")
+	}
+	if i.pluginRestart == nil {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ Telegram Agents restart is unavailable in this build")
+	}
+	if err := i.send(ctx, domain.Outgoing{ThreadID: 0, ReplyTo: cmd.MessageID,
+		Text: "Restarting the Telegram Agents daemon … Herdr and its agents will keep running."}); err != nil {
+		return err
+	}
+	done, err := i.pluginRestart(ctx)
+	if err != nil {
+		return i.reply(ctx, 0, cmd.MessageID, "⚠️ could not launch the daemon restart: "+failureReason(err))
+	}
+	i.pluginRestartBusy = true
+	if i.pluginRestartWatch != nil {
+		i.pluginRestartWatch(done, cmd.MessageID)
+	}
+	i.log.Info("Telegram Agents daemon restart launched", slog.Int64("from_id", cmd.FromID), slog.Int("message_id", cmd.MessageID))
+	return nil
+}
+
+func (i *inbound) pluginRestartFinished(ctx context.Context, result pluginRestartResult) error {
+	if !i.pluginRestartBusy {
+		return nil
+	}
+	if i.pluginRestartAlive != nil && !i.pluginRestartAlive() {
+		return nil
+	}
+	i.pluginRestartBusy = false
+	i.log.Warn("plugin restart helper exited while daemon remained active", slog.Int("message_id", result.messageID), slog.String("err", result.err.Error()))
+	return i.reply(ctx, 0, result.messageID, "⚠️ daemon restart helper failed: "+failureReason(result.err)+". You can try /restart again.")
 }
 
 // HandleStranger records an unknown sender the gateway reported, so

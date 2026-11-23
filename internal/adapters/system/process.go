@@ -17,6 +17,10 @@ import (
 // library noise). It is truncated on every spawn.
 const ErrLogFileName = "daemon.err.log"
 
+// PluginRestartErrLogFileName keeps the detached restart action's output
+// separate from the daemon that requested it.
+const PluginRestartErrLogFileName = "plugin-restart.err.log"
+
 // Process implements domain.ProcessControl for the plugin binary: detached
 // spawn into the state directory's error log, liveness checks and signals.
 type Process struct {
@@ -75,14 +79,41 @@ func (p *Process) SpawnAt(ctx context.Context, root string, args []string) (int,
 	return p.spawnExecutable(ctx, filepath.Join(root, "bin", name), args, ErrLogFileName, root)
 }
 
+// LaunchPluginRestart starts the ordinary restart action out of process, so
+// its supervisor can stop this daemon without cancelling its own work.
+func LaunchPluginRestart(ctx context.Context, stateDir string, log *slog.Logger) (int, <-chan error, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, nil, fmt.Errorf("locate executable: %w", err)
+	}
+	return launchPluginRestart(ctx, stateDir, exe, log)
+}
+
 func (p *Process) spawnExecutable(ctx context.Context, exe string, args []string, logName, rootEnv string) (int, error) {
+	pid, done, err := p.spawnExecutableWait(ctx, exe, args, logName, rootEnv)
+	if err != nil {
+		return 0, err
+	}
+	go func() {
+		err := <-done
+		p.log.Debug("spawned process exited", slog.Int("pid", pid), slog.Any("err", err))
+	}()
+	return pid, nil
+}
+
+func launchPluginRestart(ctx context.Context, stateDir, exe string, log *slog.Logger) (int, <-chan error, error) {
+	proc := NewProcess(stateDir, log)
+	return proc.spawnExecutableWait(ctx, exe, []string{"action", "restart"}, PluginRestartErrLogFileName, "")
+}
+
+func (p *Process) spawnExecutableWait(ctx context.Context, exe string, args []string, logName, rootEnv string) (int, <-chan error, error) {
 	if err := os.MkdirAll(p.stateDir, 0o700); err != nil {
-		return 0, fmt.Errorf("mkdir state dir: %w", err)
+		return 0, nil, fmt.Errorf("mkdir state dir: %w", err)
 	}
 	errPath := filepath.Join(p.stateDir, logName)
 	errLog, err := os.OpenFile(errPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return 0, fmt.Errorf("open %s: %w", errPath, err)
+		return 0, nil, fmt.Errorf("open %s: %w", errPath, err)
 	}
 	defer errLog.Close()
 
@@ -103,16 +134,14 @@ func (p *Process) spawnExecutable(ctx context.Context, exe string, args []string
 	// outlive the action that started it.
 	cmd.Cancel = func() error { return nil }
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start %s: %w", exe, err)
+		return 0, nil, fmt.Errorf("start %s: %w", exe, err)
 	}
 	pid := cmd.Process.Pid
-	// Reap the child if it exits while this process is still around, so a
-	// dead daemon never lingers as a zombie that looks alive to kill(pid, 0).
-	// In the normal case the spawning action exits first and init reaps.
+	done := make(chan error, 1)
 	go func() {
-		err := cmd.Wait()
-		p.log.Debug("spawned process exited", slog.Int("pid", pid), slog.Any("err", err))
+		done <- cmd.Wait()
+		close(done)
 	}()
 	p.log.Debug("process spawned", slog.Int("pid", pid), slog.Int("args_len", len(args)), slog.String("err_log", errPath))
-	return pid, nil
+	return pid, done, nil
 }
