@@ -33,9 +33,10 @@ type Gateway struct {
 	stream *Stream
 	events chan domain.Event
 
-	runMu  sync.Mutex
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	runMu        sync.Mutex
+	screenZoomMu sync.Mutex
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 var (
@@ -231,6 +232,79 @@ func (g *Gateway) PaneProcesses(ctx context.Context, paneID string) ([]int, erro
 // ReadScreen returns plain text from the agent's terminal.
 func (g *Gateway) ReadScreen(ctx context.Context, target string, source domain.ScreenSource, lines int) (domain.Screen, error) {
 	return g.readScreen(ctx, target, source, lines, "text", true)
+}
+
+// ReadExpandedScreen temporarily enlarges a pane for an explicitly requested
+// screen capture. Other screen reads must not change the user's layout.
+func (g *Gateway) ReadExpandedScreen(ctx context.Context, target string, lines int) (screen domain.Screen, err error) {
+	g.screenZoomMu.Lock()
+	defer g.screenZoomMu.Unlock()
+
+	before, err := g.screenLayout(ctx, target)
+	if err != nil {
+		// Older Herdr servers may not support pane.layout.
+		g.log.Debug("expanded screen unavailable", "err", err)
+		return g.ReadScreen(ctx, target, domain.ScreenVisible, lines)
+	}
+	if before.Focused == "" {
+		return g.ReadScreen(ctx, target, domain.ScreenVisible, lines)
+	}
+	if before.Focused == target && before.Zoomed {
+		return g.ReadScreen(ctx, target, domain.ScreenVisible, lines)
+	}
+
+	if err = g.screenZoom(ctx, target, "on"); err != nil {
+		return domain.Screen{}, err
+	}
+	defer func() {
+		// Restore even if the requesting Telegram context was cancelled.
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		current, layoutErr := g.screenLayout(restoreCtx, target)
+		if layoutErr != nil {
+			err = errors.Join(err, fmt.Errorf("check screen layout after capture: %w", layoutErr))
+			return
+		}
+		if !current.Zoomed || current.Focused != target {
+			return // Somebody changed the layout.
+		}
+		if before.Focused != "" && before.Focused != target {
+			if restoreErr := g.screenZoom(restoreCtx, before.Focused, "on"); restoreErr != nil {
+				g.log.Warn("screen focus restore failed", "err", restoreErr)
+				err = errors.Join(err, fmt.Errorf("restore screen focus: %w", restoreErr))
+				return
+			}
+		}
+		if !before.Zoomed {
+			if restoreErr := g.screenZoom(restoreCtx, before.Focused, "off"); restoreErr != nil {
+				g.log.Warn("screen zoom restore failed", "err", restoreErr)
+				err = errors.Join(err, fmt.Errorf("restore screen zoom: %w", restoreErr))
+			}
+		}
+	}()
+
+	// The terminal application redraws asynchronously after receiving SIGWINCH.
+	if !sleep(ctx, 250*time.Millisecond) {
+		return domain.Screen{}, ctx.Err()
+	}
+	return g.ReadScreen(ctx, target, domain.ScreenVisible, lines)
+}
+
+type screenPaneLayout struct {
+	Focused string `json:"focused_pane_id"`
+	Zoomed  bool   `json:"zoomed"`
+}
+
+func (g *Gateway) screenLayout(ctx context.Context, pane string) (screenPaneLayout, error) {
+	var result struct {
+		Layout screenPaneLayout `json:"layout"`
+	}
+	err := g.call(ctx, "pane.layout", pane, map[string]any{"pane_id": pane}, &result)
+	return result.Layout, err
+}
+
+func (g *Gateway) screenZoom(ctx context.Context, pane, mode string) error {
+	return g.call(ctx, "pane.zoom", pane, map[string]any{"pane_id": pane, "mode": mode}, nil)
 }
 
 // ReadScreenANSI is reserved for the OpenCode shell safety check. Keeping it

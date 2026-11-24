@@ -1450,7 +1450,7 @@ func (o *outbound) Screen(ctx context.Context, key domain.Key, lines int) error 
 			return nil
 		}
 	}
-	screen, err := o.herdr.ReadScreen(ctx, key.PaneID, domain.ScreenVisible, lines)
+	screen, err := requestedScreen(ctx, o.herdr, key.PaneID, lines)
 	if err != nil {
 		return err
 	}

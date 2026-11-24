@@ -429,7 +429,7 @@ func (p *PrivateControl) screen(ctx context.Context, o domain.ShareOrigin, lines
 	if lines == 0 {
 		lines = domain.MaxScreenLines
 	}
-	screen, err := p.Herdr.ReadScreen(callCtx, o.Key.PaneID, domain.ScreenVisible, lines)
+	screen, err := requestedScreen(callCtx, p.Herdr, o.Key.PaneID, lines)
 	if err != nil {
 		return p.send(ctx, o, "Screen unavailable.")
 	}
